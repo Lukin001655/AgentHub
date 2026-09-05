@@ -206,7 +206,7 @@ struct AgentWorkspacesViewModelTests {
       placement: placement,
       isDark: true
     )
-    try await Task.sleep(for: .milliseconds(80))
+    await coordinator.waitUntilMonitored(sessionID: "codex-session")
 
     #expect(surface.launches.count == 1)
     #expect(surface.launches.first?.kind == .agent(.codex))
@@ -502,6 +502,17 @@ private final class WorkspaceSessionCoordinatorSpy: AgentWorkspaceSessionCoordin
 
   func monitorDetectedSession(_ result: AccessorySessionDetectionResult) async {
     monitoredSessionIDs.append(result.sessionId)
+  }
+
+  func waitUntilMonitored(
+    sessionID: String,
+    timeout: Duration = .seconds(2)
+  ) async {
+    let start = ContinuousClock.now
+    while !monitoredSessionIDs.contains(sessionID), ContinuousClock.now - start < timeout {
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    #expect(monitoredSessionIDs.contains(sessionID))
   }
 
   func restorePersistedSessions(_ references: [AgentWorkspaceSessionReference]) async {
