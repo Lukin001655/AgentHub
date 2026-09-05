@@ -33,7 +33,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-spm-
 
-      # Gate on the fast, stable `swift test` module packages only.
+      # Gate on release metadata plus the fast, stable `swift test` modules.
       #
       # The AgentHubCore suite is intentionally NOT run in CI: it costs ~20 min
       # just to compile and has a flaky timing tail on slow runners, so its CI
@@ -44,5 +44,5 @@ jobs:
       #
       # To make AgentHubCore CI-worthy and gate on it, harden the timing tests
       # (injectable clocks / deterministic awaits) — see TestQuarantine.md / #380.
-      - name: Run package tests
+      - name: Run release metadata and package tests
         run: bash scripts/test.sh packages

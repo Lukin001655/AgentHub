@@ -6,6 +6,7 @@
 #   scripts/test.sh             # packages (fast) then core (slow)  [default]
 #   scripts/test.sh core        # AgentHubCore xcodebuild suite only
 #   scripts/test.sh packages    # fast `swift test` packages only
+#   scripts/test.sh release     # release metadata/workflow tests only
 #
 # Notes:
 #   - The AgentHubCore suite cannot run under `swift test`: it depends on
@@ -38,6 +39,17 @@ FAILURES=()
 # test still fails; a one-off flake passes on retry). The chronically-flaky suites
 # are quarantined at the source (see TestQuarantine.md / #380) so retries are rare.
 PKG_ATTEMPTS="${AGENTHUB_PKG_ATTEMPTS:-3}"
+
+run_release_metadata_tests() {
+  echo ""
+  echo "▶ python unittest: release metadata"
+  if ( cd "$ROOT" && python3 -m unittest discover -s scripts/tests -p 'test_*.py' ); then
+    echo "✓ release metadata"
+  else
+    echo "✗ release metadata"
+    FAILURES+=("python unittest: release metadata")
+  fi
+}
 
 run_packages() {
   for pkg in "${SWIFT_TEST_PACKAGES[@]}"; do
@@ -95,10 +107,11 @@ run_core() {
 }
 
 case "${1:-all}" in
-  core)     run_core ;;
-  packages) run_packages ;;
-  all)      run_packages; run_core ;;   # cheap failures surface first
-  *)        echo "usage: scripts/test.sh [all|core|packages]" >&2; exit 2 ;;
+  release)  run_release_metadata_tests ;;
+  core)     run_release_metadata_tests; run_core ;;
+  packages) run_release_metadata_tests; run_packages ;;
+  all)      run_release_metadata_tests; run_packages; run_core ;;   # cheap failures surface first
+  *)        echo "usage: scripts/test.sh [all|core|packages|release]" >&2; exit 2 ;;
 esac
 
 echo ""

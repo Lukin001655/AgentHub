@@ -8,12 +8,34 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: agenthub-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        id: release-version
+        run: |
+          python3 scripts/validate_sparkle_release.py validate-tag \
+            "$GITHUB_REF_NAME" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Capture current appcast
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tag commit must already be contained in origin/main." >&2
+            exit 1
+          fi
+          git show origin/main:appcast.xml > "$RUNNER_TEMP/current-appcast.xml"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -47,6 +69,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
 
       - name: Build app
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
         run: |
           xcodebuild -project app/AgentHub.xcodeproj \
             -scheme AgentHub \
@@ -58,6 +82,8 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Developer ID Application" \
             DEVELOPMENT_TEAM=${{ secrets.TEAM_ID }} \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$VERSION" \
             archive
 
       - name: Export app
@@ -66,6 +92,17 @@ jobs:
             -archivePath build/AgentHub.xcarchive \
             -exportPath build \
             -exportOptionsPlist app/ExportOptions.plist
+
+      - name: Inspect exported bundle versions
+        id: bundle-version
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          python3 scripts/validate_sparkle_release.py inspect-bundle \
+            --tag "v${VERSION}" \
+            --app-plist build/AgentHub.app/Contents/Info.plist \
+            --current-appcast "$RUNNER_TEMP/current-appcast.xml" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Notarize app
         env:
@@ -101,17 +138,17 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
-            echo "SPARKLE_PRIVATE_KEY not set. Skipping Sparkle signature generation."
-            exit 0
+            echo "SPARKLE_PRIVATE_KEY is required for a release." >&2
+            exit 1
           fi
           # Find the Sparkle sign_update tool
-          SIGN_UPDATE=$(find ~/Library/Developer/Xcode/DerivedData -name sign_update -type f 2>/dev/null | head -1)
+          SIGN_UPDATE=$(find ~/Library/Developer/Xcode/DerivedData -name sign_update -type f -print -quit 2>/dev/null)
           if [ -n "$SIGN_UPDATE" ]; then
             echo "$SPARKLE_PRIVATE_KEY" | "$SIGN_UPDATE" build/AgentHub.app.zip --ed-key-file - > build/sparkle-signature.txt
             cat build/sparkle-signature.txt
           else
-            echo "Warning: sign_update tool not found. Skipping Sparkle signature generation."
-            echo "You can generate the signature manually after download."
+            echo "Sparkle sign_update tool was not found." >&2
+            exit 1
           fi
 
       - name: Create DMG
@@ -151,6 +188,60 @@ jobs:
           cat AgentHub.dmg.sha256
           cat AgentHub.app.zip.sha256
 
+      # Release invariant: values published to Sparkle come from the exported
+      # application bundle. The Git tag is an independently validated input.
+      - name: Prepare appcast item
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
+          BUNDLE_VERSION: ${{ steps.bundle-version.outputs.machine_version }}
+          BUNDLE_SHORT_VERSION: ${{ steps.bundle-version.outputs.display_version }}
+        run: |
+          PUB_DATE=$(date -u "+%a, %d %b %Y %H:%M:%S %z")
+
+          if [ ! -s build/sparkle-signature.txt ]; then
+            echo "sparkle-signature.txt is required for a release." >&2
+            exit 1
+          fi
+          ED_SIGNATURE=$(grep -o 'edSignature="[^"]*"' build/sparkle-signature.txt | head -1 | sed 's/edSignature="//;s/"//')
+          if [ -z "$ED_SIGNATURE" ]; then
+            ED_SIGNATURE=$(head -1 build/sparkle-signature.txt)
+          fi
+          LENGTH=$(cat build/AgentHub.app.zip.size)
+
+          {
+            echo '    <item xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
+            echo "      <title>Version ${BUNDLE_SHORT_VERSION}</title>"
+            echo "      <link>https://github.com/jamesrochabrun/AgentHub/releases/tag/v${VERSION}</link>"
+            echo "      <sparkle:version>${BUNDLE_VERSION}</sparkle:version>"
+            echo "      <sparkle:shortVersionString>${BUNDLE_SHORT_VERSION}</sparkle:shortVersionString>"
+            echo '      <description><![CDATA['
+            echo "        <h2>Version ${BUNDLE_SHORT_VERSION}</h2>"
+            echo '        <ul>'
+            echo '          <li>See release notes on GitHub</li>'
+            echo '        </ul>'
+            echo '      ]]></description>'
+            echo "      <pubDate>${PUB_DATE}</pubDate>"
+            echo '      <enclosure'
+            echo "        url=\"https://github.com/jamesrochabrun/AgentHub/releases/download/v${VERSION}/AgentHub.app.zip\""
+            echo "        sparkle:version=\"${BUNDLE_VERSION}\""
+            echo "        sparkle:shortVersionString=\"${BUNDLE_SHORT_VERSION}\""
+            echo "        sparkle:edSignature=\"${ED_SIGNATURE}\""
+            echo "        length=\"${LENGTH}\""
+            echo '        type="application/octet-stream" />'
+            echo '      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>'
+            echo '    </item>'
+          } > build/new_item.xml
+
+      - name: Validate release metadata
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
+        run: |
+          python3 scripts/validate_sparkle_release.py validate-release \
+            --tag "v${VERSION}" \
+            --app-plist build/AgentHub.app/Contents/Info.plist \
+            --current-appcast "$RUNNER_TEMP/current-appcast.xml" \
+            --candidate-item build/new_item.xml
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -166,54 +257,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update appcast.xml
+      - name: Publish appcast item
+        env:
+          VERSION: ${{ steps.release-version.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PUB_DATE=$(date -u "+%a, %d %b %Y %H:%M:%S %z")
-
-          # Parse Sparkle signature
-          if [ ! -f build/sparkle-signature.txt ]; then
-            echo "Warning: sparkle-signature.txt not found. Skipping appcast update."
-            exit 0
+          # Use exactly the main revision captured before build. Release jobs
+          # are serialized; a changed feed fails closed instead of overwriting.
+          git checkout -B main origin/main
+          if ! cmp -s "$RUNNER_TEMP/current-appcast.xml" appcast.xml; then
+            echo "appcast.xml changed during the release job." >&2
+            exit 1
           fi
-          ED_SIGNATURE=$(grep -o 'edSignature="[^"]*"' build/sparkle-signature.txt | head -1 | sed 's/edSignature="//;s/"//')
-          if [ -z "$ED_SIGNATURE" ]; then
-            ED_SIGNATURE=$(cat build/sparkle-signature.txt | head -1)
-          fi
-          LENGTH=$(cat build/AgentHub.app.zip.size)
-
-          echo "Version: $VERSION"
-          echo "Signature: $ED_SIGNATURE"
-          echo "Length: $LENGTH"
-
-          # Build the new <item> block and write to file
-          {
-            echo '    <item>'
-            echo "      <title>Version ${VERSION}</title>"
-            echo "      <link>https://github.com/jamesrochabrun/AgentHub/releases/tag/v${VERSION}</link>"
-            echo "      <sparkle:version>${VERSION}</sparkle:version>"
-            echo "      <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>"
-            echo '      <description><![CDATA['
-            echo "        <h2>Version ${VERSION}</h2>"
-            echo '        <ul>'
-            echo '          <li>See release notes on GitHub</li>'
-            echo '        </ul>'
-            echo '      ]]></description>'
-            echo "      <pubDate>${PUB_DATE}</pubDate>"
-            echo '      <enclosure'
-            echo "        url=\"https://github.com/jamesrochabrun/AgentHub/releases/download/v${VERSION}/AgentHub.app.zip\""
-            echo "        sparkle:version=\"${VERSION}\""
-            echo "        sparkle:shortVersionString=\"${VERSION}\""
-            echo "        sparkle:edSignature=\"${ED_SIGNATURE}\""
-            echo "        length=\"${LENGTH}\""
-            echo '        type="application/octet-stream" />'
-            echo '      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>'
-            echo '    </item>'
-          } > build/new_item.xml
-
-          # Switch to main branch and update appcast.xml
-          git fetch origin main
-          git checkout main
 
           # Insert new item as first <item> in appcast.xml (after the <language> line)
           awk '/<language>en<\/language>/{print; print ""; while ((getline line < "build/new_item.xml") > 0) print line; next}1' appcast.xml > appcast_tmp.xml

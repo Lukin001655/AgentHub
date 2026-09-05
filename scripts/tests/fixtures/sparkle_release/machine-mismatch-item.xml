@@ -1,0 +1,6 @@
+<item xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <title>Version 2.16.1</title>
+  <sparkle:version>2.16.0</sparkle:version>
+  <sparkle:shortVersionString>2.16.1</sparkle:shortVersionString>
+  <enclosure sparkle:version="2.16.0" sparkle:shortVersionString="2.16.1" />
+</item>

@@ -1,0 +1,110 @@
+name: Validate Sparkle release metadata
+
+on:
+  push:
+    branches:
+      - 'validation/sparkle-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric candidate version greater than the current appcast
+        required: true
+        default: '2.16.1'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate candidate version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            CANDIDATE_VERSION="$REQUESTED_VERSION"
+          else
+            CANDIDATE_VERSION="${GITHUB_REF_NAME#validation/sparkle-v}"
+          fi
+          python3 scripts/validate_sparkle_release.py validate-tag \
+            "v${CANDIDATE_VERSION}"
+          echo "VERSION=${CANDIDATE_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.4.1'
+
+      - name: Install build dependency
+        run: brew install libgit2
+
+      - name: Run full test gate
+        run: bash scripts/test.sh
+
+      - name: Build unsigned Release archive
+        run: |
+          xcodebuild -project app/AgentHub.xcodeproj \
+            -scheme AgentHub \
+            -configuration Release \
+            -archivePath build/AgentHub.xcarchive \
+            -skipPackagePluginValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$VERSION" \
+            archive
+
+      - name: Inspect unsigned archive versions
+        id: bundle-version
+        run: |
+          python3 scripts/validate_sparkle_release.py inspect-bundle \
+            --tag "v${VERSION}" \
+            --app-plist build/AgentHub.xcarchive/Products/Applications/AgentHub.app/Contents/Info.plist \
+            --current-appcast appcast.xml \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare validation appcast item
+        env:
+          BUNDLE_VERSION: ${{ steps.bundle-version.outputs.machine_version }}
+          BUNDLE_SHORT_VERSION: ${{ steps.bundle-version.outputs.display_version }}
+        run: |
+          {
+            echo '<item xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
+            echo "  <sparkle:version>${BUNDLE_VERSION}</sparkle:version>"
+            echo "  <sparkle:shortVersionString>${BUNDLE_SHORT_VERSION}</sparkle:shortVersionString>"
+            echo "  <enclosure sparkle:version=\"${BUNDLE_VERSION}\" sparkle:shortVersionString=\"${BUNDLE_SHORT_VERSION}\" />"
+            echo '</item>'
+          } > build/validation-item.xml
+
+      - name: Validate archive and appcast contract
+        run: |
+          python3 scripts/validate_sparkle_release.py validate-release \
+            --tag "v${VERSION}" \
+            --app-plist build/AgentHub.xcarchive/Products/Applications/AgentHub.app/Contents/Info.plist \
+            --current-appcast appcast.xml \
+            --candidate-item build/validation-item.xml
+
+      - name: Package test-only evidence
+        run: |
+          ditto -c -k --keepParent \
+            build/AgentHub.xcarchive/Products/Applications/AgentHub.app \
+            build/AgentHub-unsigned-test-only.zip
+          shasum -a 256 build/AgentHub-unsigned-test-only.zip > build/AgentHub-unsigned-test-only.zip.sha256
+          git rev-parse HEAD > build/source-commit.txt
+
+      - name: Upload test-only evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentHub-unsigned-test-only-${{ github.run_id }}
+          path: |
+            build/AgentHub-unsigned-test-only.zip
+            build/AgentHub-unsigned-test-only.zip.sha256
+            build/source-commit.txt
+            build/validation-item.xml
+          retention-days: 7
