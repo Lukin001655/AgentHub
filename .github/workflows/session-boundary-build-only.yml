@@ -1,0 +1,118 @@
+name: Codex Session Boundary Build Only (UNTESTED)
+
+on:
+  push:
+    branches:
+      - build/codex-session-boundary-untested-20260906
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-session-boundary-build-only-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-unsigned-untested:
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      # Locked CodeEdit dependencies attach SwiftLintPlugin. Xcode 26 reports
+      # their absent empty output directory as a build failure after clean lint.
+      DISABLE_SWIFTLINT: '1'
+      PRODUCT_SOURCE_SHA: f452d1e1f9a4f7f5d3d0e35f208c3fe329a128e3
+
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.4.1'
+
+      - name: Install build dependency
+        run: brew install libgit2
+
+      - name: Cache Swift Package Manager dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-session-boundary-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-session-boundary-spm-
+            ${{ runner.os }}-spm-
+
+      - name: Record source, waiver, and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-evidence
+
+          git rev-parse HEAD | tee build-evidence/workflow-commit-sha.txt
+          git rev-parse HEAD^ | tee build-evidence/product-source-sha.txt
+          test "$(git rev-parse HEAD^)" = "$PRODUCT_SOURCE_SHA"
+
+          changed_files="$(git diff --name-only HEAD^ HEAD)"
+          printf '%s\n' "$changed_files" | tee build-evidence/workflow-only-diff.txt
+          test "$changed_files" = ".github/workflows/session-boundary-build-only.yml"
+
+          git ls-tree -r "$PRODUCT_SOURCE_SHA" \
+            | shasum -a 256 \
+            | tee build-evidence/product-source-tree-manifest.sha256
+          printf '%s\n' \
+            'AUTOMATED_TESTS=SKIPPED_BY_OWNER_DIRECTIVE_2026-09-06' \
+            'ARTIFACT_STATUS=UNSIGNED_UNTESTED' \
+            | tee build-evidence/build-policy.txt
+          xcodebuild -version | tee build-evidence/xcode-version.txt
+          swift --version | tee build-evidence/swift-version.txt
+
+      - name: Build unsigned untested Release archive
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project app/AgentHub.xcodeproj \
+            -scheme AgentHub \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/AgentHub.xcarchive" \
+            -skipPackagePluginValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      - name: Inspect and package unsigned untested candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/AgentHub.xcarchive/Products/Applications/AgentHub.app"
+          test -d "$APP"
+
+          plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist" \
+            | tee build-evidence/app-version.txt
+          plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist" \
+            | tee build-evidence/app-build.txt
+          codesign -dv --verbose=4 "$APP" > build-evidence/codesign.txt 2>&1 || true
+          if grep -q '^Authority=Developer ID Application' build-evidence/codesign.txt; then
+            echo 'Unexpected Developer ID identity on build-only candidate.' >&2
+            exit 1
+          fi
+
+          ditto -c -k --keepParent "$APP" \
+            build-evidence/AgentHub-UNSIGNED-UNTESTED-session-boundary.app.zip
+          shasum -a 256 \
+            build-evidence/AgentHub-UNSIGNED-UNTESTED-session-boundary.app.zip \
+            | tee build-evidence/AgentHub-UNSIGNED-UNTESTED-session-boundary.app.zip.sha256
+          git status --short --untracked-files=no | tee build-evidence/git-status.txt
+          test ! -s build-evidence/git-status.txt
+
+      - name: Upload unsigned untested candidate and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentHub-UNSIGNED-UNTESTED-session-boundary-${{ github.sha }}
+          path: build-evidence
+          if-no-files-found: error
+          retention-days: 7
