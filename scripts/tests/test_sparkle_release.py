@@ -156,6 +156,15 @@ class SparkleValidationWorkflowShapeTests(unittest.TestCase):
     self.assertIn("contents: read", self.workflow)
     self.assertNotIn("contents: write", self.workflow)
 
+  def test_validation_workflow_uses_canonical_stable_ci_gate(self):
+    canonical_workflow = (
+      ROOT / ".github" / "workflows" / "test.yml"
+    ).read_text()
+    stable_gate = "run: bash scripts/test.sh packages"
+
+    self.assertIn(stable_gate, canonical_workflow)
+    self.assertIn(stable_gate, self.workflow)
+
   def test_validation_workflow_builds_unsigned_and_checks_metadata(self):
     validation = self.workflow.index(
       "name: Resolve and validate candidate version"

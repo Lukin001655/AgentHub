@@ -43,8 +43,8 @@ jobs:
       - name: Install build dependency
         run: brew install libgit2
 
-      - name: Run full test gate
-        run: bash scripts/test.sh
+      - name: Run release metadata and package tests
+        run: bash scripts/test.sh packages
 
       - name: Build unsigned Release archive
         run: |
