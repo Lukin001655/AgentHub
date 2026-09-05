@@ -99,6 +99,10 @@ jobs:
 
       - name: Run full AgentHubCore gate
         working-directory: app/modules/AgentHubCore
+        env:
+          # Xcode forwards only TEST_RUNNER_* variables into the XCTest host,
+          # stripping that prefix before Swift Testing reads the value.
+          TEST_RUNNER_SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH: '1'
         run: |
           set -euo pipefail
           xcodebuild test \
