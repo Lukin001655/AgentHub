@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild test \
-            -scheme Ghostty-Tests \
+            -scheme Ghostty \
             -destination 'platform=macOS' \
             -test-timeouts-enabled YES \
             -default-test-execution-time-allowance 60 \
