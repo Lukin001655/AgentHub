@@ -100,6 +100,9 @@ jobs:
       - name: Run full AgentHubCore gate
         env:
           AGENTHUB_TEST_RESULT_BUNDLE: ${{ runner.temp }}/AgentHubCoreFull.xcresult
+          # The full suite has shared async/timer state and is unstable under
+          # Swift Testing's default unbounded in-process parallelism on CI.
+          SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH: '1'
         run: bash scripts/test.sh core
 
       - name: Build unsigned isolated Release archive
