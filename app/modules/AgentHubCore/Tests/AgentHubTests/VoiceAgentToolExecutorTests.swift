@@ -238,10 +238,7 @@ struct VoiceAgentToolExecutorTests {
     var iterator = stream.makeAsyncIterator()
 
     codex.voiceSessions = [session(id: "resolved-session")]
-    codex.recordPendingSessionResolution(
-      pendingId: pendingUUID,
-      sessionId: "resolved-session"
-    )
+    codex.resolvedPendingSessions[pendingUUID] = "resolved-session"
     codex.sessionStatuses["resolved-session"] = .thinking
 
     #expect(await iterator.next() == .thinking)
