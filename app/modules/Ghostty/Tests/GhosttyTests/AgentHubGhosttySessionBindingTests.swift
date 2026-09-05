@@ -2,6 +2,7 @@ import Testing
 
 @testable import Ghostty
 
+@MainActor
 @Suite("AgentHub Ghostty session binding")
 struct AgentHubGhosttySessionBindingTests {
   @Test("Pending context transfer updates a late process registration ID")
