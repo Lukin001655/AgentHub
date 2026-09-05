@@ -50,10 +50,10 @@ private func makeAuxiliaryShellViewModel(
     sessionRelationshipStore: sessionRelationshipStore,
     approvalNotificationService: NoOpApprovalNotificationService(),
     accessorySessionDetectionService: accessorySessionDetectionService,
-    terminalProcessRebinder: terminalProcessRebinder,
     terminalSurfaceFactory: terminalSurfaceFactory,
     terminalBackend: terminalBackend,
-    terminalWorkspaceStore: terminalWorkspaceStore
+    terminalWorkspaceStore: terminalWorkspaceStore,
+    terminalProcessRebinder: terminalProcessRebinder
   )
 }
 
