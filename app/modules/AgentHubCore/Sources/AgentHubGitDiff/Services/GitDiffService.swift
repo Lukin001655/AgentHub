@@ -5,6 +5,7 @@
 //  Created by Assistant on 1/19/26.
 //
 
+import Darwin
 import Foundation
 import os
 
@@ -52,6 +53,7 @@ public actor GitDiffService: GitDiffServiceProtocol {
   private static let limitedContextReason = "Large file rendered with changed hunks only."
   private static let backendPrintPrefix = "AGENTHUB_DIFF_BACKEND"
   private static let logger = Logger(subsystem: "com.agenthub.gitdiff", category: "GitDiff")
+  private static let processLaunchLock = NSLock()
 
   /// Index-size threshold (bytes) above which a worktree is treated as "large" and the
   /// unstaged/staged scans are routed to the native `git` CLI instead of libgit2.
@@ -892,63 +894,41 @@ public actor GitDiffService: GitDiffServiceProtocol {
     environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
     process.environment = environment
 
-    // Provide empty stdin to prevent waiting for input
-    let inputPipe = Pipe()
-    process.standardInput = inputPipe
+    // Install the exit handler before run(): short git commands can otherwise
+    // terminate before a waiter is registered and strand the continuation.
+    let exitNotifier = GitDiffProcessExitNotifier()
+    process.terminationHandler = { process in
+      exitNotifier.complete(status: process.terminationStatus)
+    }
 
-    let outputPipe = Pipe()
-    let errorPipe = Pipe()
-    process.standardOutput = outputPipe
-    process.standardError = errorPipe
-
+    let pipes: GitDiffProcessPipes
     do {
-      try process.run()
-      try inputPipe.fileHandleForWriting.close()
+      pipes = try Self.launch(process)
+      try pipes.input.fileHandleForWriting.close()
     } catch {
       Self.logger.error("Failed to start git process: \(error.localizedDescription)")
       throw GitDiffError.gitCommandFailed("Failed to start git: \(error.localizedDescription)")
     }
 
-    // CRITICAL: Read stdout/stderr concurrently BEFORE waiting for process exit
-    // This prevents deadlock when output is large enough to fill the pipe buffer.
-    // If we wait first, the process blocks trying to write, but we're waiting for it to exit.
-    var outputData: Data?
-    var errorData: Data?
-    let readGroup = DispatchGroup()
+    // Drain both streams while git runs so neither pipe buffer can block exit.
+    async let outputData = Self.readHandleToEnd(pipes.output.fileHandleForReading)
+    async let errorData = Self.readHandleToEnd(pipes.error.fileHandleForReading)
 
-    readGroup.enter()
-    DispatchQueue.global(qos: .userInitiated).async {
-      outputData = try? outputPipe.fileHandleForReading.readToEnd()
-      readGroup.leave()
-    }
-
-    readGroup.enter()
-    DispatchQueue.global(qos: .userInitiated).async {
-      errorData = try? errorPipe.fileHandleForReading.readToEnd()
-      readGroup.leave()
-    }
-
-    // Wait for reads to complete with timeout
+    // Race the latched exit against the declared timeout. The task-group scope
+    // waits for process termination before returning, so no reader or handler is
+    // left attached to a command that this call no longer owns.
     let didTimeout = await withTaskGroup(of: Bool.self) { group in
       group.addTask {
-        await withCheckedContinuation { continuation in
-          DispatchQueue.global().async {
-            // Wait for reads first
-            readGroup.wait()
-            // Then wait for process to exit
-            process.waitUntilExit()
-            continuation.resume(returning: false)
-          }
-        }
+        _ = await exitNotifier.wait()
+        return false
       }
 
       group.addTask {
         do {
           try await Task.sleep(for: .seconds(timeout))
-          if process.isRunning {
-            Self.logger.warning("Git command timed out after \(timeout)s, terminating")
-            process.terminate()
-          }
+          guard process.isRunning else { return false }
+          Self.logger.warning("Git command timed out after \(timeout)s, terminating")
+          process.terminate()
           return true
         } catch {
           return false
@@ -960,17 +940,115 @@ public actor GitDiffService: GitDiffServiceProtocol {
       return result
     }
 
-    let output = String(data: outputData ?? Data(), encoding: .utf8) ?? ""
-    let errorOutput = String(data: errorData ?? Data(), encoding: .utf8) ?? ""
+    let output = String(data: await outputData, encoding: .utf8) ?? ""
+    let errorOutput = String(data: await errorData, encoding: .utf8) ?? ""
+    let exitStatus = await exitNotifier.wait()
 
     if didTimeout {
       throw GitDiffError.timeout
     }
 
-    if !allowedExitCodes.contains(process.terminationStatus) {
-      throw GitDiffError.gitCommandFailed(errorOutput.trimmingCharacters(in: .whitespacesAndNewlines))
+    if !allowedExitCodes.contains(exitStatus) {
+      throw GitDiffError.gitCommandFailed(
+        errorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+      )
     }
 
     return output
+  }
+
+  /// Creates protected pipes and launches one git process under a lock shared
+  /// by every GitDiffService instance. This closes the Pipe() -> fcntl() race
+  /// between sibling commands before their descriptors become close-on-exec.
+  private static func launch(_ process: Process) throws -> GitDiffProcessPipes {
+    processLaunchLock.lock()
+    defer { processLaunchLock.unlock() }
+
+    let pipes = try GitDiffProcessPipes()
+    process.standardInput = pipes.input
+    process.standardOutput = pipes.output
+    process.standardError = pipes.error
+    try process.run()
+    return pipes
+  }
+
+  private nonisolated static func readHandleToEnd(_ handle: FileHandle) async -> Data {
+    await withCheckedContinuation { continuation in
+      DispatchQueue.global(qos: .userInitiated).async {
+        continuation.resume(returning: (try? handle.readToEnd()) ?? Data())
+      }
+    }
+  }
+}
+
+/// Owns the three pipes for one git invocation. Every endpoint is marked
+/// close-on-exec before Process.run(), so sibling children cannot keep a writer
+/// alive after the command that owns it has exited.
+private struct GitDiffProcessPipes {
+  let input = Pipe()
+  let output = Pipe()
+  let error = Pipe()
+
+  init() throws {
+    try Self.setCloseOnExec(input.fileHandleForReading)
+    try Self.setCloseOnExec(input.fileHandleForWriting)
+    try Self.setCloseOnExec(output.fileHandleForReading)
+    try Self.setCloseOnExec(output.fileHandleForWriting)
+    try Self.setCloseOnExec(error.fileHandleForReading)
+    try Self.setCloseOnExec(error.fileHandleForWriting)
+  }
+
+  private static func setCloseOnExec(_ handle: FileHandle) throws {
+    let descriptor = handle.fileDescriptor
+    let flags = fcntl(descriptor, F_GETFD)
+    guard flags >= 0, fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+      throw GitDiffProcessPipeError.closeOnExecFailed(descriptor: descriptor, code: errno)
+    }
+  }
+}
+
+private enum GitDiffProcessPipeError: LocalizedError {
+  case closeOnExecFailed(descriptor: Int32, code: Int32)
+
+  var errorDescription: String? {
+    switch self {
+    case .closeOnExecFailed(let descriptor, let code):
+      return "Could not protect pipe descriptor \(descriptor) (errno \(code))"
+    }
+  }
+}
+
+/// Latches process termination so a waiter registered before or after a fast
+/// exit receives the same status exactly once.
+private final class GitDiffProcessExitNotifier: @unchecked Sendable {
+  private let lock = NSLock()
+  private var status: Int32?
+  private var continuations: [CheckedContinuation<Int32, Never>] = []
+
+  func complete(status: Int32) {
+    lock.lock()
+    if self.status == nil {
+      self.status = status
+    }
+    let pending = continuations
+    continuations = []
+    lock.unlock()
+
+    for continuation in pending {
+      continuation.resume(returning: status)
+    }
+  }
+
+  func wait() async -> Int32 {
+    await withCheckedContinuation { continuation in
+      lock.lock()
+      if let status {
+        lock.unlock()
+        continuation.resume(returning: status)
+      } else {
+        continuations.append(continuation)
+        lock.unlock()
+      }
+    }
   }
 }

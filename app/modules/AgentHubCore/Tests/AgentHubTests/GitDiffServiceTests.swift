@@ -241,6 +241,64 @@ struct GitDiffServiceTests {
     #expect(payload.oldContent == "initial")
     #expect(payload.newContent == "changed")
   }
+
+  /// Regression guard for TestQuarantine cluster A: concurrent Process launches
+  /// must not inherit another Git command's pipe writers and strand readToEnd().
+  /// Completion is enforced by the test runner's timeout rather than a fragile
+  /// wall-clock assertion.
+  @Test("concurrent native and non-git probes do not strand pipe readers")
+  func concurrentNativeAndNonGitProbesDoNotStrandPipeReaders() async throws {
+    let fixture = try GitRepoFixture.create()
+    defer { fixture.cleanup() }
+    try "changed".write(toFile: fixture.repoPath + "/README.md", atomically: true, encoding: .utf8)
+    try "brand new".write(
+      toFile: fixture.repoPath + "/Added.txt",
+      atomically: true,
+      encoding: .utf8
+    )
+
+    let nonGitDirectory = FileManager.default.temporaryDirectory
+      .appending(
+        path: "GitDiffServiceConcurrentNonGit-\(UUID().uuidString)",
+        directoryHint: .isDirectory
+      )
+    try FileManager.default.createDirectory(at: nonGitDirectory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: nonGitDirectory) }
+    let repoPath = fixture.repoPath
+    let nonGitPath = nonGitDirectory.path
+
+    let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+      for _ in 0..<8 {
+        group.addTask {
+          do {
+            let service = GitDiffService(largeWorktreeIndexByteThreshold: 0)
+            let state = try await service.changedFiles(
+              at: repoPath,
+              mode: .unstaged,
+              baseBranch: nil
+            )
+            return Set(state.files.map(\.relativePath)) == ["README.md", "Added.txt"]
+          } catch {
+            return false
+          }
+        }
+
+        group.addTask {
+          let service = LocalDiffSummaryService(minimumRefreshInterval: 0)
+          return await service.summary(for: nonGitPath) == .empty
+        }
+      }
+
+      var collected: [Bool] = []
+      for await result in group {
+        collected.append(result)
+      }
+      return collected
+    }
+
+    #expect(results.count == 16)
+    #expect(results.allSatisfy { $0 })
+  }
 }
 
 private actor LocalDiffSummaryEvaluatorSpy {
