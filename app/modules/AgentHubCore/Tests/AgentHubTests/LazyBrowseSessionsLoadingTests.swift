@@ -547,6 +547,7 @@ struct LazyBrowseSessionsLoadingTests {
     try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
 
     let watcher = RecordingFileWatcher()
+    let processInspector = MutableCodexProcessOpenFileInspector()
     let monitorService = CodexSessionMonitorService(codexDataPath: root.path)
     let viewModel = CLISessionsViewModel(
       monitorService: monitorService,
@@ -555,7 +556,10 @@ struct LazyBrowseSessionsLoadingTests {
       cliConfiguration: CLICommandConfiguration(command: "codex", mode: .codex),
       providerKind: .codex,
       approvalNotificationService: NoOpApprovalNotificationService(),
-      codexDataPath: root.path
+      codexDataPath: root.path,
+      codexPendingSessionProcessResolver: CodexPendingSessionProcessResolver(
+        openFileInspector: processInspector
+      )
     )
 
     viewModel.addRepository(at: projectURL.path)
@@ -575,6 +579,10 @@ struct LazyBrowseSessionsLoadingTests {
     }
 
     let pending = try #require(viewModel.pendingHubSessions.first)
+    let pendingKey = "pending-\(pending.id.uuidString)"
+    let terminal = TestTerminalSurface()
+    terminal.currentProcessPID = 404
+    viewModel.activeTerminals[pendingKey] = terminal
     let sessionId = "44444444-4444-4444-4444-444444444444"
     let sessionsDir = root
       .appending(path: "sessions")
@@ -582,15 +590,23 @@ struct LazyBrowseSessionsLoadingTests {
       .appending(path: "05")
       .appending(path: "05")
     try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+    let sessionFile = sessionsDir.appending(
+      path: "rollout-2026-05-05T12-02-00-\(sessionId).jsonl"
+    )
+    await processInspector.setOpenFilePaths(
+      [sessionFile.path, sessionFile.resolvingSymlinksInPath().path],
+      for: 404
+    )
 
     try codexLines(
       sessionId: sessionId,
       cwd: projectURL.path,
       message: "pending codex",
-      baseInstructionsLength: 24_000
+      baseInstructionsLength: 24_000,
+      timestamp: ISO8601DateFormatter().string(from: Date())
     )
     .write(
-      to: sessionsDir.appending(path: "rollout-2026-05-05T12-02-00-\(sessionId).jsonl"),
+      to: sessionFile,
       atomically: true,
       encoding: .utf8
     )
@@ -730,7 +746,13 @@ struct LazyBrowseSessionsLoadingTests {
       viewModel.resolvedPendingSessions[pending.id] == newSessionId
     }
     #expect(viewModel.pendingHubSessions.allSatisfy { $0.id != pending.id })
-    #expect(viewModel.findSession(byId: newSessionId)?.sessionFilePath == newSessionFile.path)
+    let resolvedSessionFilePath = try #require(
+      viewModel.findSession(byId: newSessionId)?.sessionFilePath
+    )
+    #expect(
+      URL(fileURLWithPath: resolvedSessionFilePath).resolvingSymlinksInPath().path
+        == newSessionFile.resolvingSymlinksInPath().path
+    )
   }
 
   @Test("Two Codex pending sessions claim distinct rollout identities")

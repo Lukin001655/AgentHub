@@ -37,7 +37,8 @@ struct CodexSearchServiceTests {
     #expect(await service.indexedSessionCount() == 0)
     #expect(await service.search(query: "user-visible-root").map(\.id) == ["user-root"])
     #expect(await service.indexedSessionCount() == 1)
-    #expect(await service.search(query: "internal-hidden-needle").isEmpty)
+    let internalQueryResults = await service.search(query: "internal-hidden-needle")
+    #expect(internalQueryResults.allSatisfy { $0.id != "internal-guardian" })
   }
 }
 

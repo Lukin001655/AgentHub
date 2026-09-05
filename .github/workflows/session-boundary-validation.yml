@@ -16,6 +16,10 @@ jobs:
   verify-and-build:
     runs-on: macos-26
     timeout-minutes: 90
+    env:
+      # Locked CodeEdit dependencies attach SwiftLintPlugin. Xcode 26 reports
+      # their absent empty output directory as a build failure after clean lint.
+      DISABLE_SWIFTLINT: '1'
 
     steps:
       - name: Checkout exact validation commit
