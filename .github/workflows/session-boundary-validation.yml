@@ -1,0 +1,152 @@
+name: Codex Session Boundary Validation
+
+on:
+  push:
+    branches:
+      - validation/codex-session-boundary-20260905
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-session-boundary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout exact validation commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.4.1'
+
+      - name: Install build dependency
+        run: brew install libgit2
+
+      - name: Cache Swift Package Manager dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-session-boundary-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-session-boundary-spm-
+            ${{ runner.os }}-spm-
+
+      - name: Record source and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p validation-evidence
+          git rev-parse HEAD | tee validation-evidence/validation-commit-sha.txt
+          git rev-parse HEAD^ | tee validation-evidence/source-commit-sha.txt
+          git ls-tree -r --name-only HEAD | shasum -a 256 | tee validation-evidence/source-tree-manifest.sha256
+          xcodebuild -version | tee validation-evidence/xcode-version.txt
+          swift --version | tee validation-evidence/swift-version.txt
+
+      - name: Run stable package gate
+        env:
+          AGENTHUB_PKG_ATTEMPTS: '3'
+        run: bash scripts/test.sh packages
+
+      - name: Run targeted session-boundary tests
+        working-directory: app/modules/AgentHubCore
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme AgentHubCore-Tests \
+            -destination 'platform=macOS' \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 \
+            -maximum-test-execution-time-allowance 120 \
+            -resultBundlePath "$RUNNER_TEMP/AgentHubSessionBoundaryTargeted.xcresult" \
+            -skipPackagePluginValidation \
+            -only-testing:AgentHubSessionGraphTests/CodexSessionFileScannerTests \
+            -only-testing:AgentHubSessionGraphTests/CodexPendingSessionCandidateResolverTests \
+            -only-testing:AgentHubSessionGraphTests/AccessorySessionDetectionServiceTests \
+            -only-testing:AgentHubTests/CodexSearchServiceTests \
+            -only-testing:AgentHubTests/CodexWorktreeSessionImportTests \
+            -only-testing:AgentHubTests/LazyBrowseSessionsLoadingTests \
+            -only-testing:AgentHubTests/AuxiliaryShellTerminalManagementTests \
+            -only-testing:AgentHubTests/MonitoringItemsSnapshotTests \
+            -only-testing:AgentHubTests/TerminalProcessRegistryTests \
+            -only-testing:AgentHubTests/VoiceAgentToolExecutorTests
+
+      - name: Run Ghostty late-binding regression tests
+        working-directory: app/modules/Ghostty
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme Ghostty-Tests \
+            -destination 'platform=macOS' \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 \
+            -maximum-test-execution-time-allowance 120 \
+            -resultBundlePath "$RUNNER_TEMP/GhosttySessionBinding.xcresult" \
+            -skipPackagePluginValidation \
+            -only-testing:GhosttyTests/AgentHubGhosttySessionBindingTests
+
+      - name: Run full AgentHubCore gate
+        env:
+          AGENTHUB_TEST_RESULT_BUNDLE: ${{ runner.temp }}/AgentHubCoreFull.xcresult
+        run: bash scripts/test.sh core
+
+      - name: Build unsigned isolated Release archive
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project app/AgentHub.xcodeproj \
+            -scheme AgentHub \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/AgentHub.xcarchive" \
+            -skipPackagePluginValidation \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            archive
+
+      - name: Inspect and package isolated candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/AgentHub.xcarchive/Products/Applications/AgentHub.app"
+          test -d "$APP"
+          plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist" \
+            | tee validation-evidence/app-version.txt
+          plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist" \
+            | tee validation-evidence/app-build.txt
+          codesign -dv --verbose=4 "$APP" > validation-evidence/codesign.txt 2>&1 || true
+          if grep -q '^Authority=Developer ID Application' validation-evidence/codesign.txt; then
+            echo 'Unexpected Developer ID identity on isolated CI candidate.' >&2
+            exit 1
+          fi
+          ditto -c -k --keepParent "$APP" validation-evidence/AgentHub-UNSIGNED-session-boundary.app.zip
+          shasum -a 256 validation-evidence/AgentHub-UNSIGNED-session-boundary.app.zip \
+            | tee validation-evidence/AgentHub-UNSIGNED-session-boundary.app.zip.sha256
+          git status --short --untracked-files=no | tee validation-evidence/git-status.txt
+          test ! -s validation-evidence/git-status.txt
+
+      - name: Upload test result bundles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-session-boundary-test-results-${{ github.sha }}
+          path: ${{ runner.temp }}/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload unsigned candidate and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentHub-UNSIGNED-session-boundary-${{ github.sha }}
+          path: validation-evidence
+          if-no-files-found: error
+          retention-days: 7
