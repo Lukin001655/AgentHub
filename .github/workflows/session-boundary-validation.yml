@@ -98,12 +98,18 @@ jobs:
             -only-testing:GhosttyTests/AgentHubGhosttySessionBindingTests
 
       - name: Run full AgentHubCore gate
-        env:
-          AGENTHUB_TEST_RESULT_BUNDLE: ${{ runner.temp }}/AgentHubCoreFull.xcresult
-          # The full suite has shared async/timer state and is unstable under
-          # Swift Testing's default unbounded in-process parallelism on CI.
-          SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH: '1'
-        run: bash scripts/test.sh core
+        working-directory: app/modules/AgentHubCore
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -scheme AgentHubCore-Tests \
+            -destination 'platform=macOS' \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 \
+            -maximum-test-execution-time-allowance 120 \
+            -resultBundlePath "$RUNNER_TEMP/AgentHubCoreFull.xcresult" \
+            -skipPackagePluginValidation
 
       - name: Build unsigned isolated Release archive
         run: |
