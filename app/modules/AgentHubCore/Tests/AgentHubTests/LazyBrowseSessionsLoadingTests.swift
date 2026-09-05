@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import AgentHubSessionGraph
 import Testing
 
 @testable import AgentHubCore
@@ -499,6 +500,7 @@ struct LazyBrowseSessionsLoadingTests {
 
     let requestedId = "22222222-2222-2222-2222-222222222222"
     let otherId = "33333333-3333-3333-3333-333333333333"
+    let guardianId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     try codexLines(
       sessionId: requestedId,
       cwd: "/tmp/project",
@@ -516,9 +518,20 @@ struct LazyBrowseSessionsLoadingTests {
         atomically: true,
         encoding: .utf8
       )
+    try codexLines(
+      sessionId: guardianId,
+      cwd: "/tmp/project",
+      message: "internal guardian",
+      source: ["subagent": ["other": "guardian"]]
+    )
+      .write(
+        to: sessionsDir.appending(path: "rollout-2026-05-05T12-02-00-\(guardianId).jsonl"),
+        atomically: true,
+        encoding: .utf8
+      )
 
     let service = CodexSessionMonitorService(codexDataPath: root.path)
-    let sessions = await service.loadSessions(ids: [requestedId])
+    let sessions = await service.loadSessions(ids: [requestedId, guardianId])
 
     #expect(sessions.map(\.id) == [requestedId])
     #expect(sessions.first?.firstMessage == "requested")
@@ -594,6 +607,271 @@ struct LazyBrowseSessionsLoadingTests {
     await waitUntilAsync {
       (await watcher.startedSessionIds()).contains(sessionId)
     }
+  }
+
+  @Test("Codex pending session ignores an older active rollout with a recent file write")
+  func codexPendingSessionIgnoresOlderActiveRollout() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let projectURL = root.appending(path: "project", directoryHint: .isDirectory)
+    let sessionsDir = root
+      .appending(path: "sessions")
+      .appending(path: "2026")
+      .appending(path: "09")
+      .appending(path: "02")
+    try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+    let oldSessionId = "55555555-5555-5555-5555-555555555555"
+    try codexLines(
+      sessionId: oldSessionId,
+      cwd: projectURL.path,
+      message: "older active session",
+      timestamp: "2026-09-01T06:00:00.000Z"
+    ).write(
+      to: sessionsDir.appending(path: "rollout-old-\(oldSessionId).jsonl"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    let viewModel = makeCodexPendingViewModel(root: root)
+    viewModel.addRepository(at: projectURL.path)
+    await waitUntil(timeout: .seconds(6)) {
+      viewModel.loadingState == .idle && viewModel.selectedRepositories.count == 1
+    }
+    let worktree = try #require(
+      viewModel.selectedRepositories.first?.worktrees.first(where: { $0.path == projectURL.path })
+    )
+
+    viewModel.startNewSessionInHub(worktree, initialPrompt: "new independent work")
+    await waitUntil { viewModel.pendingHubSessions.count == 1 }
+    let pending = try #require(viewModel.pendingHubSessions.first)
+
+    try? await Task.sleep(for: .milliseconds(1_200))
+    #expect(viewModel.resolvedPendingSessions[pending.id] == nil)
+    #expect(viewModel.pendingHubSessions.contains(where: { $0.id == pending.id }))
+
+    let newSessionId = "66666666-6666-6666-6666-666666666666"
+    try codexLines(
+      sessionId: newSessionId,
+      cwd: projectURL.path,
+      message: "new independent work",
+      timestamp: ISO8601DateFormatter().string(from: Date())
+    ).write(
+      to: sessionsDir.appending(path: "rollout-new-\(newSessionId).jsonl"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    await waitUntil(timeout: .seconds(8)) {
+      viewModel.resolvedPendingSessions[pending.id] == newSessionId
+    }
+  }
+
+  @Test("Codex pending session resolves its owned rollout while history refresh is stale")
+  func codexPendingSessionResolvesOwnedRolloutWithStaleHistory() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let projectURL = root.appending(path: "project", directoryHint: .isDirectory)
+    let sessionsDir = root
+      .appending(path: "sessions")
+      .appending(path: "2026")
+      .appending(path: "09")
+      .appending(path: "02")
+    try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+    let existingSession = CLISession(
+      id: "55555555-5555-5555-5555-555555555555",
+      projectPath: projectURL.path,
+      branchName: "main"
+    )
+    let staleRepository = repository(path: projectURL.path, sessions: [existingSession])
+    let monitorService = LazyBrowseMockMonitorService(
+      skeletonRepositories: [staleRepository],
+      browseRepositories: [staleRepository]
+    )
+    let processInspector = MutableCodexProcessOpenFileInspector()
+    let viewModel = makeCodexPendingViewModel(
+      root: root,
+      openFileInspector: processInspector,
+      monitorService: monitorService
+    )
+    viewModel.addRepository(at: projectURL.path)
+    await waitUntil(timeout: .seconds(6)) {
+      viewModel.loadingState == .idle && viewModel.selectedRepositories.count == 1
+    }
+    let worktree = try #require(
+      viewModel.selectedRepositories.first?.worktrees.first(where: { $0.path == projectURL.path })
+    )
+
+    viewModel.startNewSessionInHub(worktree, initialPrompt: "owned rollout")
+    await waitUntil { viewModel.pendingHubSessions.count == 1 }
+    let pending = try #require(viewModel.pendingHubSessions.first)
+    let pendingKey = "pending-\(pending.id.uuidString)"
+    let terminal = TestTerminalSurface()
+    terminal.currentProcessPID = 303
+    viewModel.activeTerminals[pendingKey] = terminal
+    try? await Task.sleep(for: .milliseconds(250))
+
+    let newSessionId = "66666666-6666-6666-6666-666666666666"
+    let newSessionFile = sessionsDir.appending(path: "rollout-owned-\(newSessionId).jsonl")
+    await processInspector.setOpenFilePaths([newSessionFile.path], for: 303)
+    try codexLines(
+      sessionId: newSessionId,
+      cwd: projectURL.path,
+      message: "owned rollout",
+      timestamp: ISO8601DateFormatter().string(from: Date())
+    ).write(to: newSessionFile, atomically: true, encoding: .utf8)
+
+    await waitUntil(timeout: .seconds(8)) {
+      viewModel.resolvedPendingSessions[pending.id] == newSessionId
+    }
+    #expect(viewModel.pendingHubSessions.allSatisfy { $0.id != pending.id })
+    #expect(viewModel.findSession(byId: newSessionId)?.sessionFilePath == newSessionFile.path)
+  }
+
+  @Test("Two Codex pending sessions claim distinct rollout identities")
+  func concurrentCodexPendingSessionsClaimDistinctRollouts() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let projectURL = root.appending(path: "project", directoryHint: .isDirectory)
+    let sessionsDir = root
+      .appending(path: "sessions")
+      .appending(path: "2026")
+      .appending(path: "09")
+      .appending(path: "02")
+    try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+    let processInspector = MutableCodexProcessOpenFileInspector()
+    let viewModel = makeCodexPendingViewModel(root: root, openFileInspector: processInspector)
+    viewModel.addRepository(at: projectURL.path)
+    await waitUntil(timeout: .seconds(6)) {
+      viewModel.loadingState == .idle && viewModel.selectedRepositories.count == 1
+    }
+    let worktree = try #require(
+      viewModel.selectedRepositories.first?.worktrees.first(where: { $0.path == projectURL.path })
+    )
+
+    viewModel.startNewSessionInHub(worktree, initialPrompt: "first")
+    viewModel.startNewSessionInHub(worktree, initialPrompt: "second")
+    await waitUntil { viewModel.pendingHubSessions.count == 2 }
+    let pendingIds = viewModel.pendingHubSessions.map(\.id)
+    let firstPendingKey = "pending-\(pendingIds[0].uuidString)"
+    let secondPendingKey = "pending-\(pendingIds[1].uuidString)"
+    let firstTerminal = TestTerminalSurface()
+    firstTerminal.currentProcessPID = 101
+    let secondTerminal = TestTerminalSurface()
+    secondTerminal.currentProcessPID = 202
+    viewModel.activeTerminals[firstPendingKey] = firstTerminal
+    viewModel.activeTerminals[secondPendingKey] = secondTerminal
+    try? await Task.sleep(for: .milliseconds(250))
+
+    let firstSessionId = "77777777-7777-7777-7777-777777777777"
+    let firstSessionFile = sessionsDir.appending(path: "rollout-first-\(firstSessionId).jsonl")
+    await processInspector.setOpenFilePaths([firstSessionFile.path], for: 101)
+    try codexLines(
+      sessionId: firstSessionId,
+      cwd: projectURL.path,
+      message: "first",
+      timestamp: ISO8601DateFormatter().string(from: Date())
+    ).write(
+      to: firstSessionFile,
+      atomically: true,
+      encoding: .utf8
+    )
+
+    await waitUntil(timeout: .seconds(8)) {
+      pendingIds.filter { viewModel.resolvedPendingSessions[$0] != nil }.count == 1
+    }
+    #expect(viewModel.resolvedPendingSessions[pendingIds[0]] == firstSessionId)
+    #expect(viewModel.resolvedPendingSessions[pendingIds[1]] == nil)
+
+    let secondSessionId = "88888888-8888-8888-8888-888888888888"
+    let secondSessionFile = sessionsDir.appending(path: "rollout-second-\(secondSessionId).jsonl")
+    await processInspector.setOpenFilePaths([secondSessionFile.path], for: 202)
+    try codexLines(
+      sessionId: secondSessionId,
+      cwd: projectURL.path,
+      message: "second",
+      timestamp: ISO8601DateFormatter().string(from: Date())
+    ).write(
+      to: secondSessionFile,
+      atomically: true,
+      encoding: .utf8
+    )
+
+    await waitUntil(timeout: .seconds(8)) {
+      pendingIds.allSatisfy { viewModel.resolvedPendingSessions[$0] != nil }
+    }
+    #expect(viewModel.resolvedPendingSessions[pendingIds[0]] == firstSessionId)
+    #expect(viewModel.resolvedPendingSessions[pendingIds[1]] == secondSessionId)
+  }
+
+  @Test("Codex pending session ignores an internal guardian rollout")
+  func codexPendingSessionIgnoresGuardianRollout() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let projectURL = root.appending(path: "project", directoryHint: .isDirectory)
+    let sessionsDir = root
+      .appending(path: "sessions")
+      .appending(path: "2026")
+      .appending(path: "09")
+      .appending(path: "02")
+    try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+    let viewModel = makeCodexPendingViewModel(root: root)
+    viewModel.addRepository(at: projectURL.path)
+    await waitUntil(timeout: .seconds(6)) {
+      viewModel.loadingState == .idle && viewModel.selectedRepositories.count == 1
+    }
+    let worktree = try #require(
+      viewModel.selectedRepositories.first?.worktrees.first(where: { $0.path == projectURL.path })
+    )
+
+    viewModel.startNewSessionInHub(worktree, initialPrompt: "root request")
+    await waitUntil { viewModel.pendingHubSessions.count == 1 }
+    let pending = try #require(viewModel.pendingHubSessions.first)
+
+    let guardianSessionId = "99999999-9999-9999-9999-999999999999"
+    try codexLines(
+      sessionId: guardianSessionId,
+      cwd: projectURL.path,
+      message: "internal guardian",
+      timestamp: ISO8601DateFormatter().string(from: Date()),
+      source: ["subagent": ["other": "guardian"]]
+    ).write(
+      to: sessionsDir.appending(path: "rollout-guardian-\(guardianSessionId).jsonl"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    try? await Task.sleep(for: .milliseconds(1_200))
+    #expect(viewModel.resolvedPendingSessions[pending.id] == nil)
+    #expect(viewModel.pendingHubSessions.contains(where: { $0.id == pending.id }))
+
+    let rootSessionId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    try codexLines(
+      sessionId: rootSessionId,
+      cwd: projectURL.path,
+      message: "root request",
+      timestamp: ISO8601DateFormatter().string(from: Date())
+    ).write(
+      to: sessionsDir.appending(path: "rollout-root-\(rootSessionId).jsonl"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    await waitUntil(timeout: .seconds(8)) {
+      viewModel.resolvedPendingSessions[pending.id] == rootSessionId
+    }
+    #expect(viewModel.findSession(byId: guardianSessionId) == nil)
   }
 }
 
@@ -818,12 +1096,15 @@ private func codexLines(
   sessionId: String,
   cwd: String,
   message: String,
-  baseInstructionsLength: Int = 0
+  baseInstructionsLength: Int = 0,
+  timestamp: String = "2026-05-05T12:00:00.000Z",
+  source: Any = "cli"
 ) -> String {
   var sessionMetaPayload: [String: Any] = [
     "id": sessionId,
-    "timestamp": "2026-05-05T12:00:00.000Z",
+    "timestamp": timestamp,
     "cwd": cwd,
+    "source": source,
     "git": [
       "branch": "main"
     ]
@@ -836,7 +1117,7 @@ private func codexLines(
   }
 
   let sessionMeta: [String: Any] = [
-    "timestamp": "2026-05-05T12:00:00.000Z",
+    "timestamp": timestamp,
     "type": "session_meta",
     "payload": sessionMetaPayload
   ]
@@ -854,6 +1135,45 @@ private func codexLines(
   \(jsonLine(userMessage))
 
   """
+}
+
+@MainActor
+private func makeCodexPendingViewModel(
+  root: URL,
+  openFileInspector: any CodexProcessOpenFileInspecting = DarwinCodexProcessOpenFileInspector(),
+  monitorService: (any SessionMonitorServiceProtocol)? = nil
+) -> CLISessionsViewModel {
+  let resolvedMonitorService: any SessionMonitorServiceProtocol
+  if let monitorService {
+    resolvedMonitorService = monitorService
+  } else {
+    resolvedMonitorService = CodexSessionMonitorService(codexDataPath: root.path)
+  }
+
+  return CLISessionsViewModel(
+    monitorService: resolvedMonitorService,
+    fileWatcher: RecordingFileWatcher(),
+    searchService: nil,
+    cliConfiguration: CLICommandConfiguration(command: "codex", mode: .codex),
+    providerKind: .codex,
+    approvalNotificationService: NoOpApprovalNotificationService(),
+    codexDataPath: root.path,
+    codexPendingSessionProcessResolver: CodexPendingSessionProcessResolver(
+      openFileInspector: openFileInspector
+    )
+  )
+}
+
+private actor MutableCodexProcessOpenFileInspector: CodexProcessOpenFileInspecting {
+  private var pathsByProcessId: [Int32: Set<String>] = [:]
+
+  func setOpenFilePaths(_ paths: Set<String>, for processId: Int32) {
+    pathsByProcessId[processId] = paths
+  }
+
+  func openFilePaths(for processId: Int32) async -> Set<String> {
+    pathsByProcessId[processId] ?? []
+  }
 }
 
 private func jsonLine(_ object: [String: Any]) -> String {

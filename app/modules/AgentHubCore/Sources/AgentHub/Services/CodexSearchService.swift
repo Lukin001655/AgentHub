@@ -191,7 +191,8 @@ public actor CodexSearchService {
     var metas: [SessionMetaEntry] = []
 
     for path in files {
-      guard let meta = CodexSessionFileScanner.readSessionMeta(from: path) else { continue }
+      guard let meta = CodexSessionFileScanner.readSessionMeta(from: path),
+            meta.isUserFacingRoot else { continue }
       let lastActivity = fileModificationDate(path)
       metas.append(SessionMetaEntry(
         sessionId: meta.sessionId,

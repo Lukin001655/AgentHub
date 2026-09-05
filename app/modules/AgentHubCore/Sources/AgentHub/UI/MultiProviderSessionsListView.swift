@@ -247,6 +247,8 @@ public struct MultiProviderSessionsListView: View {
         multiLaunchViewModel = makeLaunchViewModel()
       }
       loadPinnedSessionOrderIfNeeded()
+      handleResolvedSessions(claudeViewModel.resolvedPendingSessions, provider: .claude)
+      handleResolvedSessions(codexViewModel.resolvedPendingSessions, provider: .codex)
       ensurePrimarySelection()
       scheduleInitialGitHubStateRefreshIfNeeded()
       consumeGlobalSessionSelectionIfNeeded()
@@ -258,10 +260,10 @@ public struct MultiProviderSessionsListView: View {
       consumeGlobalSessionSelectionIfNeeded()
     }
     .onChange(of: claudeViewModel.resolvedPendingSessions) { _, newResolutions in
-      handleResolvedSessions(newResolutions, provider: .claude, viewModel: claudeViewModel)
+      handleResolvedSessions(newResolutions, provider: .claude)
     }
     .onChange(of: codexViewModel.resolvedPendingSessions) { _, newResolutions in
-      handleResolvedSessions(newResolutions, provider: .codex, viewModel: codexViewModel)
+      handleResolvedSessions(newResolutions, provider: .codex)
     }
     .onChange(of: claudeViewModel.lastCreatedPendingId) { _, newId in
       guard let newId else { return }
@@ -2095,19 +2097,16 @@ public struct MultiProviderSessionsListView: View {
 
   private func handleResolvedSessions(
     _ resolutions: [UUID: String],
-    provider: SessionProviderKind,
-    viewModel: CLISessionsViewModel
+    provider: SessionProviderKind
   ) {
     guard let currentPrimary = primarySessionId else { return }
-    let providerPrefix = "pending-\(provider.rawValue.lowercased())-"
-    guard currentPrimary.hasPrefix(providerPrefix) else { return }
-    let uuidString = String(currentPrimary.dropFirst(providerPrefix.count))
-    guard let pendingUUID = UUID(uuidString: uuidString),
-          let realSessionId = resolutions[pendingUUID] else { return }
-    let newPrimaryId = "\(provider.rawValue.lowercased())-\(realSessionId)"
+    guard let newPrimaryId = SidebarSessionItemID.resolvedPendingItemID(
+      currentPrimary,
+      provider: provider,
+      resolutions: resolutions
+    ) else { return }
     AppLogger.session.info("[PrimarySelection] Resolved: \(currentPrimary.prefix(20), privacy: .public) -> \(newPrimaryId.prefix(20), privacy: .public)")
     primarySessionId = newPrimaryId
-    viewModel.resolvedPendingSessions.removeValue(forKey: pendingUUID)
   }
 
   /// - Parameter items: Prebuilt list, when the caller already has one. Deriving

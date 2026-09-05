@@ -10,6 +10,28 @@ private struct SnapshotItem: Identifiable {
 
 @Suite("MonitoringItemsSnapshot")
 struct MonitoringItemsSnapshotTests {
+  @Test("Two windows can resolve the same pending receipt without consuming it")
+  func pendingResolutionIsReusableAcrossWindows() throws {
+    let pendingID = UUID()
+    let pendingItemID = SidebarSessionItemID.pending(provider: .codex, pendingId: pendingID)
+    let resolutions = [pendingID: "real-session"]
+
+    let firstWindow = SidebarSessionItemID.resolvedPendingItemID(
+      pendingItemID,
+      provider: .codex,
+      resolutions: resolutions
+    )
+    let secondWindow = SidebarSessionItemID.resolvedPendingItemID(
+      pendingItemID,
+      provider: .codex,
+      resolutions: resolutions
+    )
+
+    #expect(firstWindow == "codex-real-session")
+    #expect(secondWindow == firstWindow)
+    #expect(resolutions[pendingID] == "real-session")
+  }
+
   @Test("Single layout exposes only the selected primary item")
   func singleLayoutUsesPrimaryItem() throws {
     let older = SnapshotItem(

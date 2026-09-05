@@ -126,8 +126,28 @@ public final class AgentHubGhosttyTerminalSurface: NSView, EmbeddedTerminalSurfa
   }
 
   public func updateContext(terminalSessionKey: String?, sessionViewModel: CLISessionsViewModel?) {
+    configuredSessionId = Self.resolvedConfiguredSessionId(
+      configuredSessionId: configuredSessionId,
+      previousTerminalKey: self.terminalSessionKey,
+      newTerminalKey: terminalSessionKey
+    )
     self.terminalSessionKey = terminalSessionKey
     self.sessionViewModel = sessionViewModel
+  }
+
+  static func resolvedConfiguredSessionId(
+    configuredSessionId: String?,
+    previousTerminalKey: String?,
+    newTerminalKey: String?
+  ) -> String? {
+    guard let configuredSessionId,
+          configuredSessionId == previousTerminalKey,
+          configuredSessionId.hasPrefix("pending-"),
+          let newTerminalKey,
+          !newTerminalKey.hasPrefix("pending-") else {
+      return configuredSessionId
+    }
+    return newTerminalKey
   }
 
   public func configure(

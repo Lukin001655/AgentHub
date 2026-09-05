@@ -24,6 +24,16 @@ protocol ProcessTerminating: Sendable {
   func terminate(pid: pid_t, processGroupId: pid_t?) async
 }
 
+public protocol TerminalProcessRebinding: Sendable {
+  @discardableResult
+  func rebind(
+    pid: Int32,
+    fromTerminalKey: String,
+    toTerminalKey: String,
+    sessionId: String
+  ) async -> Bool
+}
+
 struct DarwinProcessInspector: ProcessInspecting {
   func identity(for pid: pid_t) async -> ManagedProcessIdentity? {
     guard pid > 0, kill(pid, 0) == 0 else { return nil }
@@ -113,7 +123,7 @@ struct DarwinProcessTerminator: ProcessTerminating {
   }
 }
 
-public actor TerminalProcessRegistry {
+public actor TerminalProcessRegistry: TerminalProcessRebinding {
   public static let shared = TerminalProcessRegistry()
 
   private enum CleanupScope {
@@ -188,6 +198,64 @@ public actor TerminalProcessRegistry {
     unregisterRequests[pid] = requestedAt
     pruneOldUnregisterRequests(relativeTo: requestedAt)
     await deleteManagedProcess(pid: pid)
+  }
+
+  /// Rebinds routing metadata after a pending terminal acquires its durable
+  /// session ID. The persisted process identity must still describe this PID;
+  /// a reused or dead PID is pruned instead of being assigned a new owner.
+  @discardableResult
+  public func rebind(
+    pid: Int32,
+    fromTerminalKey: String,
+    toTerminalKey: String,
+    sessionId: String
+  ) async -> Bool {
+    guard pid > 0,
+          let fromTerminalKey = normalized(fromTerminalKey),
+          let toTerminalKey = normalized(toTerminalKey),
+          let sessionId = normalized(sessionId),
+          let store = await resolvedProcessStore() else {
+      return false
+    }
+
+    do {
+      // Process registration is launched asynchronously when the terminal
+      // surface becomes ready. A very fast Codex startup can resolve its
+      // rollout before that write reaches the store, so allow the matching
+      // registration a short bounded grace period instead of leaving a live
+      // process permanently routed under pending-*.
+      var persistedRow: ManagedProcessRecord?
+      let registrationGraceAttempts = 20
+      for attempt in 0..<registrationGraceAttempts {
+        persistedRow = try await store.getManagedProcesses().first(where: { $0.pid == pid })
+        if persistedRow != nil { break }
+        if attempt + 1 < registrationGraceAttempts {
+          try? await Task.sleep(for: .milliseconds(25))
+        }
+      }
+      guard var row = persistedRow else { return false }
+      guard let identity = await processInspector.identity(for: pid) else {
+        try await store.deleteManagedProcess(pid: pid)
+        return false
+      }
+      guard matchesStoredIdentity(row, identity: identity) else {
+        try await store.deleteManagedProcess(pid: pid)
+        return false
+      }
+      guard row.processKind?.isTerminalProcess == true,
+            row.terminalKey == fromTerminalKey else {
+        return false
+      }
+
+      row.terminalKey = toTerminalKey
+      row.sessionId = sessionId
+      row.updatedAt = Date.now
+      try await store.saveManagedProcess(row)
+      return true
+    } catch {
+      AppLogger.session.error("Failed to rebind managed process PID=\(pid): \(error.localizedDescription)")
+      return false
+    }
   }
 
   /// Returns live terminal PIDs still owned by AgentHub. Dev-server rows are

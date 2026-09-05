@@ -22,4 +22,20 @@ enum SidebarSessionItemID {
   static func pending(provider: SessionProviderKind, pendingId: UUID) -> String {
     "pending-\(provider.rawValue.lowercased())-\(pendingId.uuidString)"
   }
+
+  /// Resolves a pending row identity without consuming the shared receipt.
+  /// AgentHub can show the same session in multiple windows, so each window
+  /// must be able to observe the transition independently.
+  static func resolvedPendingItemID(
+    _ itemID: String,
+    provider: SessionProviderKind,
+    resolutions: [UUID: String]
+  ) -> String? {
+    let prefix = "pending-\(provider.rawValue.lowercased())-"
+    guard itemID.hasPrefix(prefix) else { return nil }
+    let uuidString = String(itemID.dropFirst(prefix.count))
+    guard let pendingID = UUID(uuidString: uuidString),
+          let sessionID = resolutions[pendingID] else { return nil }
+    return monitored(provider: provider, sessionId: sessionID)
+  }
 }

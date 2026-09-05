@@ -133,9 +133,49 @@ struct AccessorySessionDetectionServiceTests {
     #expect(result?.sessionId == "right")
     #expect(result?.projectPath == projectPath)
   }
+
+  @Test("Codex detection ignores internal guardian rollouts")
+  func codexDetectionIgnoresGuardianRollouts() throws {
+    let root = try temporaryAccessoryDetectionDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codexPath = root.appending(path: ".codex").path
+    let sessionsDir = root.appending(path: ".codex/sessions/2026/09/05")
+    try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+
+    let service = AccessorySessionDetectionService(
+      claudeDataPath: root.appending(path: ".claude").path,
+      codexDataPath: codexPath
+    )
+    let projectPath = "/tmp/accessory-project"
+    let startedAt = Date()
+    let baseline = service.makeBaseline(provider: .codex, projectPath: projectPath, startedAt: startedAt)
+
+    try codexSessionFile(
+      sessionId: "guardian",
+      cwd: projectPath,
+      source: ["subagent": ["other": "guardian"]]
+    ).write(
+      to: sessionsDir.appending(path: "guardian.jsonl"),
+      atomically: true,
+      encoding: .utf8
+    )
+
+    let result = service.detectNewSession(
+      provider: .codex,
+      projectPath: projectPath,
+      startedAt: startedAt,
+      baseline: baseline
+    )
+
+    #expect(result == nil)
+  }
 }
 
-private func codexSessionFile(sessionId: String, cwd: String) -> String {
+private func codexSessionFile(
+  sessionId: String,
+  cwd: String,
+  source: Any = "cli"
+) -> String {
   let meta: [String: Any] = [
     "timestamp": "2026-05-22T12:00:00.000Z",
     "type": "session_meta",
@@ -143,6 +183,7 @@ private func codexSessionFile(sessionId: String, cwd: String) -> String {
       "id": sessionId,
       "timestamp": "2026-05-22T12:00:00.000Z",
       "cwd": cwd,
+      "source": source,
       "git": ["branch": "main"]
     ]
   ]

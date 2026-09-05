@@ -156,6 +156,7 @@ public struct AccessorySessionDetectionService: AccessorySessionDetectionService
     for path in files {
       guard let modifiedAt = fileActivityDate(path), modifiedAt >= cutoff else { continue }
       guard let meta = CodexSessionFileScanner.readSessionMeta(from: path) else { continue }
+      guard meta.isFreshInteractiveRoot else { continue }
       guard meta.projectPath == projectPath || meta.projectPath.hasPrefix(projectPath + "/") else { continue }
       matches.append(meta)
     }

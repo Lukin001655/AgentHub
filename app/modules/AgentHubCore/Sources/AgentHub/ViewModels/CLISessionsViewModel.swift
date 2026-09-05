@@ -9,6 +9,7 @@ import AgentHubCLIKit
 import AgentHubGitDiff
 import AgentHubGitHub
 import AgentHubMCPUI
+import AgentHubSessionGraph
 import Darwin
 import Foundation
 import Combine
@@ -50,6 +51,8 @@ public final class CLISessionsViewModel {
   private let hookInstaller: (any ClaudeHookInstallerProtocol)?
   private let terminalSurfaceFactory: any EmbeddedTerminalSurfaceFactory
   private let terminalBackend: EmbeddedTerminalBackend
+  private let codexPendingSessionProcessResolver: CodexPendingSessionProcessResolver
+  private let terminalProcessRebinder: any TerminalProcessRebinding
   @ObservationIgnored private var terminalWorkspaceSaveTasks: [String: Task<Void, Never>] = [:]
   @ObservationIgnored private var workspaceStatePersistTask: Task<Void, Never>?
   /// Guards `refresh()` so overlapping callers never run `refreshSessions`
@@ -61,6 +64,18 @@ public final class CLISessionsViewModel {
   /// Live kqueue watchers for pending Hub sessions, keyed by pending id, so
   /// cancellation/resolution can release their directory descriptors.
   @ObservationIgnored private var pendingSessionWatchers: [UUID: PendingSessionDirectoryWatcher] = [:]
+  /// Codex session IDs reserved while a pending launch is being resolved.
+  /// Reserved before async refresh so concurrent pending cards cannot claim
+  /// the same newly observed rollout; released after the transfer completes.
+  @ObservationIgnored private var claimedCodexSessionIds: Set<String> = []
+  /// Pending Codex launches that overlapped another launch in the same cwd.
+  /// They must resolve by terminal-process provenance even after the sibling
+  /// pending card resolves first.
+  @ObservationIgnored private var codexProcessOwnershipRequiredPendingIds: Set<UUID> = []
+  /// Lifetime aliases prevent a stale SwiftUI render from recreating a terminal
+  /// under a pending key after that terminal has moved to its durable ID.
+  @ObservationIgnored private var resolvedPendingTerminalAliases: [String: String] = [:]
+  @ObservationIgnored private var resolvedPendingSessionOrder: [UUID] = []
   /// Per-session FIFO for file-watcher start/stop operations. Unordered
   /// fire-and-forget Tasks let a stop overtake an in-flight start (the start
   /// hops through the claim store first), which orphaned a live watcher whose
@@ -1443,6 +1458,22 @@ public final class CLISessionsViewModel {
     permissionModePlan: Bool = false,
     worktreeName: String? = nil
   ) -> any EmbeddedTerminalSurface {
+    if let resolvedSessionId = resolvedPendingTerminalAliases[key] {
+      return getOrCreateTerminal(
+        forKey: resolvedSessionId,
+        sessionId: resolvedSessionId,
+        projectPath: projectPath,
+        cliConfiguration: cliConfiguration,
+        initialPrompt: nil,
+        initialInputText: nil,
+        launchContext: nil,
+        isDark: isDark,
+        dangerouslySkipPermissions: dangerouslySkipPermissions,
+        permissionModePlan: permissionModePlan,
+        worktreeName: worktreeName
+      )
+    }
+
     let config = cliConfiguration ?? self.currentCLIConfiguration
     let queuedInputText = consumePendingTerminalInputText(for: key)
     let isNewSession = (
@@ -1533,6 +1564,14 @@ public final class CLISessionsViewModel {
     projectPath: String,
     isDark: Bool = true
   ) -> any EmbeddedTerminalSurface {
+    if let resolvedSessionId = resolvedPendingTerminalAliases[key] {
+      return getOrCreateAuxiliaryShellTerminal(
+        forKey: resolvedSessionId,
+        projectPath: projectPath,
+        isDark: isDark
+      )
+    }
+
     let descriptor = TerminalSurfaceDescriptor.shell(projectPath: projectPath, isDark: isDark, shellPath: nil)
 
     if let existing = auxiliaryShellTerminals[key] {
@@ -1604,13 +1643,37 @@ public final class CLISessionsViewModel {
   }
 
   /// Transfers terminal from pending key to real session ID (for pending → real transition)
-  public func transferTerminal(fromPendingId pendingId: UUID, toSessionId sessionId: String) {
+  @discardableResult
+  public func transferTerminal(fromPendingId pendingId: UUID, toSessionId sessionId: String) -> Bool {
     let pendingKey = "pending-\(pendingId.uuidString)"
+    guard canTransferTerminals(fromPendingKey: pendingKey, toSessionId: sessionId) else {
+      AppLogger.session.error(
+        "[Terminal] Refusing pending transfer to occupied session ID \(sessionId, privacy: .public)"
+      )
+      return false
+    }
+
+    resolvedPendingTerminalAliases[pendingKey] = sessionId
     if let terminal = activeTerminals.removeValue(forKey: pendingKey) {
       activeTerminals[sessionId] = terminal
       terminal.updateContext(terminalSessionKey: sessionId, sessionViewModel: self)
       configureTerminalWorkspacePersistence(for: terminal, key: sessionId, sessionId: sessionId)
       persistCurrentWorkspaceIfNeeded(for: terminal, key: sessionId, sessionId: sessionId, debounce: false)
+      if let pid = terminal.currentProcessPID {
+        Task { [terminalProcessRebinder] in
+          let rebound = await terminalProcessRebinder.rebind(
+            pid: pid,
+            fromTerminalKey: pendingKey,
+            toTerminalKey: sessionId,
+            sessionId: sessionId
+          )
+          if !rebound {
+            AppLogger.session.error(
+              "[Terminal] Failed to rebind managed PID \(pid) from \(pendingKey, privacy: .public) to \(sessionId, privacy: .public)"
+            )
+          }
+        }
+      }
     }
     if let descriptor = activeTerminalDescriptors.removeValue(forKey: pendingKey) {
       activeTerminalDescriptors[sessionId] = descriptor.transferred(toSessionId: sessionId)
@@ -1618,6 +1681,23 @@ public final class CLISessionsViewModel {
     transferQueuedWebPreviewContext(from: pendingKey, to: sessionId)
     transferAccessoryDetection(parentKey: pendingKey, to: sessionId)
     persistPendingAccessoryRelationships(parentKey: pendingKey, resolvedParentSessionId: sessionId)
+    return true
+  }
+
+  private func canTransferTerminals(fromPendingKey pendingKey: String, toSessionId sessionId: String) -> Bool {
+    if activeTerminalDescriptors[sessionId] != nil, activeTerminals[sessionId] == nil {
+      return false
+    }
+    if let destination = activeTerminals[sessionId] {
+      guard let pending = activeTerminals[pendingKey], destination === pending else { return false }
+    }
+    if auxiliaryShellTerminalDescriptors[sessionId] != nil, auxiliaryShellTerminals[sessionId] == nil {
+      return false
+    }
+    if let destination = auxiliaryShellTerminals[sessionId] {
+      guard let pending = auxiliaryShellTerminals[pendingKey], destination === pending else { return false }
+    }
+    return true
   }
 
   /// Removes the auxiliary shell terminal for a given key and terminates its process.
@@ -1724,7 +1804,23 @@ public final class CLISessionsViewModel {
 
   /// Maps pending session UUIDs to their resolved real session IDs.
   /// Used by the sidebar to update `primarySessionId` when a pending session becomes real.
-  public var resolvedPendingSessions: [UUID: String] = [:]
+  public private(set) var resolvedPendingSessions: [UUID: String] = [:]
+
+  func recordPendingSessionResolution(pendingId: UUID, sessionId: String) {
+    resolvedPendingSessions[pendingId] = sessionId
+    resolvedPendingSessionOrder.removeAll { $0 == pendingId }
+    resolvedPendingSessionOrder.append(pendingId)
+
+    let receiptLimit = 256
+    if resolvedPendingSessionOrder.count > receiptLimit {
+      let overflowCount = resolvedPendingSessionOrder.count - receiptLimit
+      let expired = Array(resolvedPendingSessionOrder.prefix(overflowCount))
+      resolvedPendingSessionOrder.removeFirst(overflowCount)
+      for id in expired {
+        resolvedPendingSessions.removeValue(forKey: id)
+      }
+    }
+  }
 
   /// Set when a new pending session is created; observed by the sidebar to auto-select it.
   /// The sidebar nils this out after reading it.
@@ -1854,7 +1950,9 @@ public final class CLISessionsViewModel {
     worktreeRemovalService: any GitWorktreeRemovalServiceProtocol = GitWorktreeService(),
     terminalSurfaceFactory: any EmbeddedTerminalSurfaceFactory = DefaultEmbeddedTerminalSurfaceFactory(),
     terminalBackend: EmbeddedTerminalBackend = .storedPreference,
-    terminalWorkspaceStore: (any TerminalWorkspaceStoreProtocol)? = nil
+    terminalWorkspaceStore: (any TerminalWorkspaceStoreProtocol)? = nil,
+    codexPendingSessionProcessResolver: CodexPendingSessionProcessResolver = CodexPendingSessionProcessResolver(),
+    terminalProcessRebinder: any TerminalProcessRebinding = TerminalProcessRegistry.shared
   ) {
     // [CLISessionsVM] init called")
     self.monitorService = monitorService
@@ -1875,6 +1973,8 @@ public final class CLISessionsViewModel {
     self.worktreeRemovalService = worktreeRemovalService
     self.terminalSurfaceFactory = terminalSurfaceFactory
     self.terminalBackend = terminalBackend
+    self.codexPendingSessionProcessResolver = codexPendingSessionProcessResolver
+    self.terminalProcessRebinder = terminalProcessRebinder
     self.cliConfiguration = cliConfiguration
     self.providerKind = providerKind
     self.codexDataPath = NSString(string: codexDataPath ?? "~/.codex").expandingTildeInPath
@@ -3715,6 +3815,18 @@ public final class CLISessionsViewModel {
       permissionModePlan: permissionModePlan,
       worktreeName: worktreeName
     )
+    if providerKind == .codex {
+      let normalizedProjectPath = WorktreeModuleResolver.normalizedDirectoryPath(pending.projectPath)
+      let overlappingPendingIds = pendingHubSessions.compactMap { existing -> UUID? in
+        WorktreeModuleResolver.normalizedDirectoryPath(existing.projectPath) == normalizedProjectPath
+          ? existing.id
+          : nil
+      }
+      if !overlappingPendingIds.isEmpty {
+        codexProcessOwnershipRequiredPendingIds.insert(pending.id)
+        codexProcessOwnershipRequiredPendingIds.formUnion(overlappingPendingIds)
+      }
+    }
     pendingHubSessions.append(pending)
     lastCreatedPendingId = pending.id
     if let promptForTerminalSubmission {
@@ -3760,7 +3872,10 @@ public final class CLISessionsViewModel {
     removeAuxiliaryShellTerminal(forKey: pendingKey)
     pendingSessionWatchers.removeValue(forKey: pending.id)?.cancel()
     pendingHubSessions.removeAll { $0.id == pending.id }
+    codexProcessOwnershipRequiredPendingIds.remove(pending.id)
     resolvedPendingSessions.removeValue(forKey: pending.id)
+    resolvedPendingSessionOrder.removeAll { $0 == pending.id }
+    resolvedPendingTerminalAliases.removeValue(forKey: pendingKey)
   }
 
   /// Watches for a new session file for the active provider.
@@ -3892,6 +4007,31 @@ public final class CLISessionsViewModel {
     return newest?.file
   }
 
+  @discardableResult
+  private func completePendingResolution(
+    pending: PendingHubSession,
+    session: CLISession
+  ) -> Bool {
+    guard transferTerminal(fromPendingId: pending.id, toSessionId: session.id) else {
+      AppLogger.session.error(
+        "[HandleNewSession] Kept pending session because destination \(session.id, privacy: .public) is already occupied"
+      )
+      return false
+    }
+
+    pendingHubSessions.removeAll { $0.id == pending.id }
+    codexProcessOwnershipRequiredPendingIds.remove(pending.id)
+    claimedCodexSessionIds.remove(session.id)
+    recordPendingSessionResolution(pendingId: pending.id, sessionId: session.id)
+    persistLaunchContext(pending: pending, sessionId: session.id)
+    transferAuxiliaryShellTerminal(fromPendingId: pending.id, toSessionId: session.id)
+    startMonitoring(session: session)
+    AppLogger.session.info(
+      "[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(session.id.prefix(8), privacy: .public)"
+    )
+    return true
+  }
+
   /// Handles when a new session file is detected
   private func handleNewSessionFound(
     sessionId: String,
@@ -3938,15 +4078,7 @@ public final class CLISessionsViewModel {
         for repo in selectedRepositories {
           if let matchingWorktree = repo.worktrees.first(where: { $0.path == expectedWorktreePath || $0.path == worktree.path }),
              let session = matchingWorktree.sessions.first(where: { $0.id == sessionId }) {
-            // Remove pending only after finding the real session
-            pendingHubSessions.removeAll { $0.id == pending.id }
-            resolvedPendingSessions[pending.id] = session.id
-            persistLaunchContext(pending: pending, sessionId: session.id)
-            AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(session.id.prefix(8), privacy: .public)")
-            transferTerminal(fromPendingId: pending.id, toSessionId: session.id)
-            transferAuxiliaryShellTerminal(fromPendingId: pending.id, toSessionId: session.id)
-            startMonitoring(session: session)
-            found = true
+            found = completePendingResolution(pending: pending, session: session)
             break
           }
         }
@@ -3957,13 +4089,7 @@ public final class CLISessionsViewModel {
         for repo in selectedRepositories {
           for wt in repo.worktrees {
             if let session = wt.sessions.first(where: { $0.id == sessionId }) {
-              pendingHubSessions.removeAll { $0.id == pending.id }
-              resolvedPendingSessions[pending.id] = session.id
-              persistLaunchContext(pending: pending, sessionId: session.id)
-              AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(session.id.prefix(8), privacy: .public)")
-              transferTerminal(fromPendingId: pending.id, toSessionId: session.id)
-              transferAuxiliaryShellTerminal(fromPendingId: pending.id, toSessionId: session.id)
-              startMonitoring(session: session)
+              _ = completePendingResolution(pending: pending, session: session)
               return
             }
           }
@@ -4001,13 +4127,7 @@ public final class CLISessionsViewModel {
             }
           }
 
-          pendingHubSessions.removeAll { $0.id == pending.id }
-          resolvedPendingSessions[pending.id] = sessionId
-          persistLaunchContext(pending: pending, sessionId: sessionId)
-          AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(sessionId.prefix(8), privacy: .public)")
-          transferTerminal(fromPendingId: pending.id, toSessionId: sessionId)
-          transferAuxiliaryShellTerminal(fromPendingId: pending.id, toSessionId: sessionId)
-          startMonitoring(session: newSession)
+          guard completePendingResolution(pending: pending, session: newSession) else { return }
 #if DEBUG
           AppLogger.session.info(
             "[HandleNewSession-Fallback] sessionId=\(sessionId, privacy: .public) created session directly from file (new worktree)"
@@ -4016,13 +4136,7 @@ public final class CLISessionsViewModel {
           return
         }
 
-        let currentSessions = selectedRepositories
-          .flatMap { $0.worktrees }
-          .first { $0.path == worktree.path }?
-          .sessions ?? []
-
         if providerKind == .codex,
-           currentSessions.isEmpty,
            let sessionFilePath {
           let newSession = CLISession(
             id: sessionId,
@@ -4045,13 +4159,7 @@ public final class CLISessionsViewModel {
             }
           }
 
-          pendingHubSessions.removeAll { $0.id == pending.id }
-          resolvedPendingSessions[pending.id] = sessionId
-          persistLaunchContext(pending: pending, sessionId: sessionId)
-          AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(sessionId.prefix(8), privacy: .public)")
-          transferTerminal(fromPendingId: pending.id, toSessionId: sessionId)
-          transferAuxiliaryShellTerminal(fromPendingId: pending.id, toSessionId: sessionId)
-          startMonitoring(session: newSession)
+          guard completePendingResolution(pending: pending, session: newSession) else { return }
 #if DEBUG
           AppLogger.session.info(
             "[HandleNewSession-Fallback] sessionId=\(sessionId, privacy: .public) created Codex session directly from file"
@@ -4181,13 +4289,18 @@ public final class CLISessionsViewModel {
   @MainActor
   private func watchForNewCodexSession(pending: PendingHubSession, worktree: WorktreeBranch) async {
     var knownFiles = Set(CodexSessionFileScanner.listSessionFiles(codexDataPath: codexDataPath))
+    let owningProcessId = activeTerminals["pending-\(pending.id.uuidString)"]?.currentProcessPID
 
-    if let meta = findRecentCodexSession(
+    if let meta = await codexPendingSessionProcessResolver.selectCandidate(
       in: knownFiles,
-      pending: pending,
-      worktree: worktree,
-      pendingStartedAt: pending.startedAt
+      matchingProjectRoots: [pending.projectPath, worktree.path],
+      pendingStartedAt: pending.startedAt,
+      requiresIntrinsicStartAfterPending: true,
+      claimedSessionIds: claimedCodexSessionIds,
+      owningProcessId: owningProcessId,
+      requiresProcessOwnership: true
     ) {
+      claimedCodexSessionIds.insert(meta.sessionId)
       handleNewSessionFound(
         sessionId: meta.sessionId,
         pending: pending,
@@ -4222,13 +4335,35 @@ public final class CLISessionsViewModel {
 
       let currentFiles = Set(CodexSessionFileScanner.listSessionFiles(codexDataPath: codexPath))
       let newFiles = currentFiles.subtracting(knownFiles)
+      let requiresProcessOwnership = codexProcessOwnershipRequiredPendingIds.contains(pending.id)
+      let owningProcessId = activeTerminals["pending-\(pending.id.uuidString)"]?.currentProcessPID
 
-      if let meta = findRecentCodexSession(
-        in: newFiles.isEmpty ? currentFiles : newFiles,
-        pending: pending,
-        worktree: worktree,
-        pendingStartedAt: pending.startedAt
-      ) {
+      let processOwnedCandidate = await codexPendingSessionProcessResolver.selectCandidate(
+        in: currentFiles,
+        matchingProjectRoots: [pending.projectPath, worktree.path],
+        pendingStartedAt: pending.startedAt,
+        requiresIntrinsicStartAfterPending: true,
+        claimedSessionIds: claimedCodexSessionIds,
+        owningProcessId: owningProcessId,
+        requiresProcessOwnership: true
+      )
+      let newFileCandidate: CodexSessionMeta?
+      if requiresProcessOwnership {
+        newFileCandidate = nil
+      } else {
+        newFileCandidate = await codexPendingSessionProcessResolver.selectCandidate(
+          in: newFiles,
+          matchingProjectRoots: [pending.projectPath, worktree.path],
+          pendingStartedAt: pending.startedAt,
+          requiresIntrinsicStartAfterPending: false,
+          claimedSessionIds: claimedCodexSessionIds,
+          owningProcessId: nil,
+          requiresProcessOwnership: false
+        )
+      }
+
+      if let meta = processOwnedCandidate ?? newFileCandidate {
+        claimedCodexSessionIds.insert(meta.sessionId)
         handleNewSessionFound(
           sessionId: meta.sessionId,
           pending: pending,
@@ -4240,53 +4375,6 @@ public final class CLISessionsViewModel {
 
       knownFiles = currentFiles
     }
-  }
-
-  private func findRecentCodexSession(
-    in filePaths: Set<String>,
-    pending: PendingHubSession,
-    worktree: WorktreeBranch,
-    pendingStartedAt: Date
-  ) -> CodexSessionMeta? {
-    guard !filePaths.isEmpty else { return nil }
-
-    let cutoff = pendingStartedAt.addingTimeInterval(-2)
-    var newest: (meta: CodexSessionMeta, modifiedAt: Date)?
-
-    for path in filePaths {
-      guard let modifiedAt = fileModificationDate(path), modifiedAt >= cutoff else { continue }
-      guard let meta = CodexSessionFileScanner.readSessionMeta(from: path) else { continue }
-      guard codexSessionMatchesPending(meta, pending: pending, worktree: worktree) else { continue }
-
-      if let current = newest {
-        if modifiedAt > current.modifiedAt {
-          newest = (meta, modifiedAt)
-        }
-      } else {
-        newest = (meta, modifiedAt)
-      }
-    }
-
-    return newest?.meta
-  }
-
-  private func codexSessionMatchesPending(
-    _ meta: CodexSessionMeta,
-    pending: PendingHubSession,
-    worktree: WorktreeBranch
-  ) -> Bool {
-    meta.projectPath == pending.projectPath
-      || meta.projectPath.hasPrefix(pending.projectPath + "/")
-      || meta.projectPath == worktree.path
-      || meta.projectPath.hasPrefix(worktree.path + "/")
-  }
-
-  private func fileModificationDate(_ path: String) -> Date? {
-    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-          let modDate = attrs[.modificationDate] as? Date else {
-      return nil
-    }
-    return modDate
   }
 
   /// Copies the full session ID to the clipboard

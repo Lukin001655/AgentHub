@@ -7,11 +7,19 @@
 
 import Foundation
 
+public enum CodexSessionSource: Equatable, Sendable {
+  case cli
+  case subagent
+  case other
+  case missing
+}
+
 public struct CodexSessionMeta: Sendable {
   public let sessionId: String
   public let projectPath: String
   public let branch: String?
   public let startedAt: Date?
+  public let source: CodexSessionSource
   public let sessionFilePath: String
 
   public init(
@@ -19,13 +27,27 @@ public struct CodexSessionMeta: Sendable {
     projectPath: String,
     branch: String?,
     startedAt: Date?,
+    source: CodexSessionSource,
     sessionFilePath: String
   ) {
     self.sessionId = sessionId
     self.projectPath = projectPath
     self.branch = branch
     self.startedAt = startedAt
+    self.source = source
     self.sessionFilePath = sessionFilePath
+  }
+
+  /// Internal Codex agent rollouts are implementation detail, not sidebar sessions.
+  /// Older root rollouts without source metadata remain browseable read-only.
+  public var isUserFacingRoot: Bool {
+    source != .subagent
+  }
+
+  /// AgentHub launches the interactive Codex CLI, whose root rollout source is `cli`.
+  /// Fresh pending binding is stricter than legacy browse to prevent ambiguous adoption.
+  public var isFreshInteractiveRoot: Bool {
+    source == .cli
   }
 }
 
@@ -76,14 +98,27 @@ public enum CodexSessionFileScanner {
       ?? CodexTimestampParser.parse(json["timestamp"] as? String)
     let git = payload["git"] as? [String: Any]
     let branch = git?["branch"] as? String
+    let source = parseSource(payload["source"])
 
     return CodexSessionMeta(
       sessionId: sessionId,
       projectPath: cwd,
       branch: branch,
       startedAt: startedAt,
+      source: source,
       sessionFilePath: path
     )
+  }
+
+  private static func parseSource(_ value: Any?) -> CodexSessionSource {
+    guard let value else { return .missing }
+    if let string = value as? String {
+      return string == "cli" ? .cli : .other
+    }
+    if let object = value as? [String: Any], object["subagent"] != nil {
+      return .subagent
+    }
+    return .other
   }
 
   private static func readFirstLine(from handle: FileHandle) -> String? {

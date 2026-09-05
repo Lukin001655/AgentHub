@@ -198,6 +198,7 @@ public actor CodexSessionMonitorService {
       URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent.hasSuffix(sessionId)
     }) {
       guard let meta = CodexSessionFileScanner.readSessionMeta(from: path),
+            meta.isUserFacingRoot,
             ids.contains(meta.sessionId) else {
         continue
       }
@@ -239,6 +240,7 @@ public actor CodexSessionMonitorService {
 
     for path in files {
       guard let meta = CodexSessionFileScanner.readSessionMeta(from: path),
+            meta.isUserFacingRoot,
             !excludingSessionIds.contains(meta.sessionId) else {
         continue
       }
@@ -425,6 +427,7 @@ public actor CodexSessionMonitorService {
 
     for path in files {
       guard let meta = CodexSessionFileScanner.readSessionMeta(from: path),
+            meta.isUserFacingRoot,
             scope.includes(projectPath: meta.projectPath, sessionId: meta.sessionId) else {
         continue
       }

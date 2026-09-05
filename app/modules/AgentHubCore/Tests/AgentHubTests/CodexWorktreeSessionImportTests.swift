@@ -25,6 +25,13 @@ struct CodexWorktreeSessionImportTests {
     try writeCodexSession(root: root, id: "session-3", cwd: worktreePath, timestamp: "2026-05-05T12:03:00.000Z")
     try writeCodexSession(root: root, id: "session-4", cwd: worktreePath, timestamp: "2026-05-05T12:04:00.000Z")
     try writeCodexSession(root: root, id: "session-5", cwd: worktreePath, timestamp: "2026-05-05T12:05:00.000Z")
+    try writeCodexSession(
+      root: root,
+      id: "internal-guardian",
+      cwd: worktreePath,
+      timestamp: "2026-05-05T12:05:30.000Z",
+      source: ["subagent": ["other": "guardian"]]
+    )
     try writeCodexSession(root: root, id: "session-out", cwd: root.appending(path: "Other").path, timestamp: "2026-05-05T12:06:00.000Z")
 
     let page = await service.loadLatestSessions(
@@ -44,7 +51,8 @@ private func writeCodexSession(
   root: URL,
   id: String,
   cwd: String,
-  timestamp: String
+  timestamp: String,
+  source: Any? = nil
 ) throws {
   let sessionsDirectory = root
     .appending(path: "sessions")
@@ -54,7 +62,7 @@ private func writeCodexSession(
   try FileManager.default.createDirectory(at: sessionsDirectory, withIntermediateDirectories: true)
 
   let fileURL = sessionsDirectory.appending(path: "rollout-\(id).jsonl")
-  try codexSessionLines(id: id, cwd: cwd, timestamp: timestamp)
+  try codexSessionLines(id: id, cwd: cwd, timestamp: timestamp, source: source)
     .write(to: fileURL, atomically: true, encoding: .utf8)
 
   if let modificationDate = iso8601Date(timestamp) {
@@ -62,18 +70,27 @@ private func writeCodexSession(
   }
 }
 
-private func codexSessionLines(id: String, cwd: String, timestamp: String) -> String {
+private func codexSessionLines(
+  id: String,
+  cwd: String,
+  timestamp: String,
+  source: Any?
+) -> String {
+  var payload: [String: Any] = [
+    "id": id,
+    "timestamp": timestamp,
+    "cwd": cwd,
+    "git": [
+      "branch": "feature/import"
+    ]
+  ]
+  if let source {
+    payload["source"] = source
+  }
   let sessionMeta: [String: Any] = [
     "timestamp": timestamp,
     "type": "session_meta",
-    "payload": [
-      "id": id,
-      "timestamp": timestamp,
-      "cwd": cwd,
-      "git": [
-        "branch": "feature/import"
-      ]
-    ]
+    "payload": payload
   ]
   let userMessage: [String: Any] = [
     "timestamp": timestamp,

@@ -79,6 +79,103 @@ struct TerminalProcessRegistryTests {
     #expect(try await store.getManagedProcesses().isEmpty)
   }
 
+  @Test("Rebind updates routing only for the same live process identity")
+  func rebindUpdatesMatchingProcessIdentity() async throws {
+    let store = MockManagedProcessStore(records: [
+      processRow(
+        pid: 123,
+        kind: .agentTerminal,
+        startTime: 1_000,
+        terminalKey: "pending-123",
+        sessionId: nil
+      )
+    ])
+    let registry = TerminalProcessRegistry(
+      store: store,
+      processInspector: MockProcessInspector(identities: [
+        123: identity(pid: 123, groupId: 123, startTime: 1_000)
+      ]),
+      processTerminator: MockProcessTerminator()
+    )
+
+    let rebound = await registry.rebind(
+      pid: 123,
+      fromTerminalKey: "pending-123",
+      toTerminalKey: "session-123",
+      sessionId: "session-123"
+    )
+
+    let row = try #require(await store.getManagedProcesses().first)
+    #expect(rebound)
+    #expect(row.terminalKey == "session-123")
+    #expect(row.sessionId == "session-123")
+    #expect(row.processStartTimeSeconds == 1_000)
+  }
+
+  @Test("Rebind prunes a PID-reuse row instead of changing its owner")
+  func rebindRejectsPIDReuse() async throws {
+    let store = MockManagedProcessStore(records: [
+      processRow(
+        pid: 123,
+        kind: .agentTerminal,
+        startTime: 1_000,
+        terminalKey: "pending-123",
+        sessionId: nil
+      )
+    ])
+    let registry = TerminalProcessRegistry(
+      store: store,
+      processInspector: MockProcessInspector(identities: [
+        123: identity(pid: 123, groupId: 123, startTime: 2_000)
+      ]),
+      processTerminator: MockProcessTerminator()
+    )
+
+    let rebound = await registry.rebind(
+      pid: 123,
+      fromTerminalKey: "pending-123",
+      toTerminalKey: "session-123",
+      sessionId: "session-123"
+    )
+
+    #expect(!rebound)
+    #expect(try await store.getManagedProcesses().isEmpty)
+  }
+
+  @Test("Rebind waits for an in-flight process registration")
+  func rebindWaitsForLateRegistration() async throws {
+    let store = MockManagedProcessStore()
+    let registry = TerminalProcessRegistry(
+      store: store,
+      processInspector: MockProcessInspector(identities: [
+        123: identity(pid: 123, groupId: 123, startTime: 1_000)
+      ]),
+      processTerminator: MockProcessTerminator()
+    )
+
+    let rebindTask = Task {
+      await registry.rebind(
+        pid: 123,
+        fromTerminalKey: "pending-123",
+        toTerminalKey: "session-123",
+        sessionId: "session-123"
+      )
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    try await store.saveManagedProcess(processRow(
+      pid: 123,
+      kind: .agentTerminal,
+      startTime: 1_000,
+      terminalKey: "pending-123",
+      sessionId: "pending-123"
+    ))
+
+    #expect(await rebindTask.value)
+    let row = try #require(await store.getManagedProcesses().first)
+    #expect(row.terminalKey == "session-123")
+    #expect(row.sessionId == "session-123")
+  }
+
   @Test("Alive registered PIDs excludes dev servers and prunes stale terminal rows")
   func aliveRegisteredPIDsExcludeDevServersAndPruneStaleRows() async throws {
     let store = MockManagedProcessStore(records: [
@@ -322,14 +419,18 @@ private func processRow(
   pid: Int32,
   kind: ManagedProcessKind,
   startTime: Int64,
-  provider: SessionProviderKind? = nil
+  provider: SessionProviderKind? = nil,
+  terminalKey: String? = nil,
+  sessionId: String? = nil
 ) -> ManagedProcessRecord {
   processRow(
     pid: pid,
     kind: kind,
     startTime: startTime,
     processGroupId: pid,
-    provider: provider
+    provider: provider,
+    terminalKey: terminalKey,
+    sessionId: sessionId
   )
 }
 
@@ -338,7 +439,9 @@ private func processRow(
   kind: ManagedProcessKind,
   startTime: Int64,
   processGroupId: Int32,
-  provider: SessionProviderKind? = nil
+  provider: SessionProviderKind? = nil,
+  terminalKey: String? = nil,
+  sessionId: String? = nil
 ) -> ManagedProcessRecord {
   ManagedProcessRecord(
     pid: pid,
@@ -346,8 +449,8 @@ private func processRow(
     processStartTimeSeconds: startTime,
     kind: kind,
     provider: provider?.rawValue,
-    terminalKey: nil,
-    sessionId: nil,
+    terminalKey: terminalKey,
+    sessionId: sessionId,
     projectPath: nil,
     expectedExecutable: nil,
     registeredAt: Date(timeIntervalSince1970: 1),

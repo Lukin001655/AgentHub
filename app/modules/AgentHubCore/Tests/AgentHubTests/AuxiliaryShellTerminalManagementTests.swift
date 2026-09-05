@@ -38,7 +38,8 @@ private func makeAuxiliaryShellViewModel(
   terminalBackend: EmbeddedTerminalBackend = .storedPreference,
   terminalWorkspaceStore: (any TerminalWorkspaceStoreProtocol)? = nil,
   sessionRelationshipStore: (any SessionRelationshipStoreProtocol)? = nil,
-  accessorySessionDetectionService: any AccessorySessionDetectionServiceProtocol = AccessorySessionDetectionService()
+  accessorySessionDetectionService: any AccessorySessionDetectionServiceProtocol = AccessorySessionDetectionService(),
+  terminalProcessRebinder: any TerminalProcessRebinding = TerminalProcessRegistry.shared
 ) -> CLISessionsViewModel {
   CLISessionsViewModel(
     monitorService: AuxiliaryShellStubMonitorService(),
@@ -49,6 +50,7 @@ private func makeAuxiliaryShellViewModel(
     sessionRelationshipStore: sessionRelationshipStore,
     approvalNotificationService: NoOpApprovalNotificationService(),
     accessorySessionDetectionService: accessorySessionDetectionService,
+    terminalProcessRebinder: terminalProcessRebinder,
     terminalSurfaceFactory: terminalSurfaceFactory,
     terminalBackend: terminalBackend,
     terminalWorkspaceStore: terminalWorkspaceStore
@@ -56,7 +58,7 @@ private func makeAuxiliaryShellViewModel(
 }
 
 @MainActor
-private final class TestTerminalSurface: NSView, EmbeddedTerminalSurface {
+final class TestTerminalSurface: NSView, EmbeddedTerminalSurface {
   var view: NSView { self }
   var currentProcessPID: Int32?
   var onUserInteraction: (() -> Void)?
@@ -751,6 +753,143 @@ struct AuxiliaryShellTerminalManagementTests {
 
     #expect(store.savedSnapshot(provider: .claude, sessionId: "session-123", backend: .ghostty) == snapshot)
   }
+
+  @Test("Pending transfer never overwrites a different terminal at the real session ID")
+  @MainActor
+  func pendingTransferRejectsDestinationCollision() {
+    let viewModel = makeAuxiliaryShellViewModel()
+    let pendingID = UUID()
+    let pendingKey = "pending-\(pendingID.uuidString)"
+    let pendingTerminal = TestTerminalSurface()
+    let existingTerminal = TestTerminalSurface()
+    viewModel.activeTerminals[pendingKey] = pendingTerminal
+    viewModel.activeTerminals["session-123"] = existingTerminal
+
+    let transferred = viewModel.transferTerminal(
+      fromPendingId: pendingID,
+      toSessionId: "session-123"
+    )
+
+    #expect(!transferred)
+    #expect(viewModel.activeTerminals[pendingKey]?.view === pendingTerminal)
+    #expect(viewModel.activeTerminals["session-123"]?.view === existingTerminal)
+  }
+
+  @Test("A resolved pending key aliases the transferred terminal without relaunch")
+  @MainActor
+  func resolvedPendingKeyDoesNotCreateSecondTerminal() {
+    let transferredSurface = TestTerminalSurface()
+    let transferredShellSurface = TestTerminalSurface()
+    let unexpectedSurface = TestTerminalSurface()
+    let factory = RecordingTerminalSurfaceFactory(surfaces: [unexpectedSurface])
+    let viewModel = makeAuxiliaryShellViewModel(terminalSurfaceFactory: factory)
+    let pendingID = UUID()
+    let pendingKey = "pending-\(pendingID.uuidString)"
+    viewModel.activeTerminals[pendingKey] = transferredSurface
+    viewModel.auxiliaryShellTerminals[pendingKey] = transferredShellSurface
+
+    #expect(viewModel.transferTerminal(fromPendingId: pendingID, toSessionId: "session-123"))
+    viewModel.transferAuxiliaryShellTerminal(fromPendingId: pendingID, toSessionId: "session-123")
+
+    let resolved = viewModel.getOrCreateTerminal(
+      forKey: pendingKey,
+      sessionId: pendingKey,
+      projectPath: "/tmp/project",
+      initialPrompt: "must not be sent"
+    )
+    let resolvedShell = viewModel.getOrCreateAuxiliaryShellTerminal(
+      forKey: pendingKey,
+      projectPath: "/tmp/project"
+    )
+
+    #expect(resolved.view === transferredSurface)
+    #expect(resolvedShell.view === transferredShellSurface)
+    #expect(factory.requestedBackends.isEmpty)
+    #expect(transferredSurface.sentPrompts.isEmpty)
+  }
+
+  @Test("Successful transfer rebinds the managed process receipt")
+  @MainActor
+  func successfulTransferRebindsProcessReceipt() async throws {
+    let rebinder = RecordingTerminalProcessRebinder()
+    let viewModel = makeAuxiliaryShellViewModel(terminalProcessRebinder: rebinder)
+    let pendingID = UUID()
+    let pendingKey = "pending-\(pendingID.uuidString)"
+    let surface = TestTerminalSurface()
+    surface.currentProcessPID = 123
+    viewModel.activeTerminals[pendingKey] = surface
+
+    #expect(viewModel.transferTerminal(fromPendingId: pendingID, toSessionId: "session-123"))
+
+    await waitUntilAsync {
+      await rebinder.requests().count == 1
+    }
+    #expect(await rebinder.requests() == [
+      ProcessRebindRequest(
+        pid: 123,
+        fromTerminalKey: pendingKey,
+        toTerminalKey: "session-123",
+        sessionId: "session-123"
+      )
+    ])
+  }
+
+  @Test("Resolved pending receipts are bounded and remain readable by multiple views")
+  @MainActor
+  func resolvedPendingReceiptsAreBounded() {
+    let viewModel = makeAuxiliaryShellViewModel()
+    let ids = (0..<260).map { _ in UUID() }
+
+    for (index, id) in ids.enumerated() {
+      viewModel.recordPendingSessionResolution(pendingId: id, sessionId: "session-\(index)")
+    }
+
+    #expect(viewModel.resolvedPendingSessions.count == 256)
+    #expect(viewModel.resolvedPendingSessions[ids[0]] == nil)
+    #expect(viewModel.resolvedPendingSessions[ids[4]] == "session-4")
+    #expect(viewModel.resolvedPendingSessions[ids[259]] == "session-259")
+  }
+}
+
+private struct ProcessRebindRequest: Equatable, Sendable {
+  let pid: Int32
+  let fromTerminalKey: String
+  let toTerminalKey: String
+  let sessionId: String
+}
+
+private actor RecordingTerminalProcessRebinder: TerminalProcessRebinding {
+  private var recordedRequests: [ProcessRebindRequest] = []
+
+  func rebind(
+    pid: Int32,
+    fromTerminalKey: String,
+    toTerminalKey: String,
+    sessionId: String
+  ) async -> Bool {
+    recordedRequests.append(ProcessRebindRequest(
+      pid: pid,
+      fromTerminalKey: fromTerminalKey,
+      toTerminalKey: toTerminalKey,
+      sessionId: sessionId
+    ))
+    return true
+  }
+
+  func requests() -> [ProcessRebindRequest] {
+    recordedRequests
+  }
+}
+
+private func waitUntilAsync(
+  timeout: Duration = .seconds(2),
+  condition: @escaping () async -> Bool
+) async {
+  let start = ContinuousClock.now
+  while !(await condition()), ContinuousClock.now - start < timeout {
+    try? await Task.sleep(for: .milliseconds(20))
+  }
+  #expect(await condition())
 }
 
 private func makeQueuedElement() -> ElementInspectorData {

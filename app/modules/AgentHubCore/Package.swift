@@ -210,6 +210,7 @@ let package = Package(
       name: "AgentHubTests",
       dependencies: [
         "AgentHubCore",
+        "AgentHubSessionGraph",
         .product(name: "AgentHubCLIKit", package: "AgentHubCLI"),
         "AgentHubGitDiff",
         "AgentHubFileSearch",
